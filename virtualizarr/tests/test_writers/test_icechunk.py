@@ -791,6 +791,34 @@ def test_manifest_etags_checked_per_object_at_read_time(
         x[0]
 
 
+def test_hdf_parser_etag_checked_at_read_time(
+    icechunk_filestore: "IcechunkStore", tmp_path: Path
+):
+    """The ETag the HDF parser's reader observed reaches icechunk, so a
+    reference whose object no longer carries that ETag fails to read."""
+    from icechunk import IcechunkError
+    from obspec_utils.readers import BlockStoreReader
+
+    from virtualizarr.parsers import HDFParser
+
+    class StaleETagReader(BlockStoreReader):
+        e_tag = '"etag-that-cannot-match"'
+
+    path = tmp_path / "test.nc"
+    xr.Dataset({"foo": (("x", "y"), np.arange(12).reshape(3, 4))}).to_netcdf(
+        path, engine="h5netcdf"
+    )
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    parser = HDFParser(reader_factory=StaleETagReader, record_etag=True)
+    with open_virtual_dataset(
+        url=f"file://{path}", registry=registry, parser=parser, loadable_variables=[]
+    ) as vds:
+        vds.vz.to_icechunk(icechunk_filestore)
+
+    with pytest.raises(IcechunkError):
+        zarr.open_array(icechunk_filestore, path="foo")[:]
+
+
 def test_roundtrip_coords(
     manifest_array, icechunk_filestore: "IcechunkStore", icechunk_repo: "Repository"
 ):

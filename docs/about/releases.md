@@ -18,6 +18,13 @@
   ETags for the same object raises. When `etag` is not given, `to_icechunk`
   checks each chunk against its object's recorded ETag, so a virtual dataset combined
   from many files gets per-file ETag checksums.
+- `HDFParser(record_etag=True)` records the ETag its reader observed on every chunk
+  manifest it builds (the reader must expose it as `e_tag`, as obspec-utils readers do
+  after 0.9.0), so `to_icechunk` stamps HDF5/NetCDF4 references with the source file's
+  ETag with no extra request. Passing a reader that sends `If-Match` on every read
+  (obspec-utils' `pin_etag=True`) additionally guarantees the parse read a single
+  revision of the file. Off by default, since icechunk 2.2.0 rejects matching ETags
+  for `file://` references.
 
 ### Breaking changes
 

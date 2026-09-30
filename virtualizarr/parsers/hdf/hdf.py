@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Iterable,
+    Mapping,
 )
 
 import numpy as np
@@ -63,6 +64,7 @@ def _construct_manifest_array(
     filepath: str,
     dataset: H5Dataset,
     group: str,
+    etags: Mapping[str, str] | None = None,
 ) -> ManifestArray:
     """
     Construct a ManifestArray from an h5py dataset
@@ -75,6 +77,8 @@ def _construct_manifest_array(
         An h5py dataset.
     group
         Name of the group containing this h5py.Dataset.
+    etags
+        Source object path -> ETag to record on the chunk manifest.
 
     Returns
     -------
@@ -142,7 +146,7 @@ def _construct_manifest_array(
         dimension_names=dims,
         attributes=attrs,
     )
-    manifest = _dataset_chunk_manifest(filepath, dataset, chunks=chunks)
+    manifest = _dataset_chunk_manifest(filepath, dataset, chunks=chunks, etags=etags)
     return ManifestArray(metadata=metadata, chunkmanifest=manifest)
 
 
@@ -199,6 +203,7 @@ def _construct_manifest_group(
     *,
     group: str | None = None,
     drop_variables: Iterable[str] | None = None,
+    record_etag: bool = False,
 ) -> ManifestGroup:
     """
     Construct a virtual Group from a HDF dataset.
@@ -209,6 +214,20 @@ def _construct_manifest_group(
         if not isinstance(g := f.get(group or "/"), h5py.Group):
             raise ValueError(f"Group {group!r} is not an HDF Group")
 
+        # Opening the file has read from it, so a reader that tracks the ETag
+        # (obspec-utils readers expose it as `e_tag`) has observed it by now:
+        # before or with the bytes these references are generated from.
+        etags = None
+        if record_etag:
+            e_tag = getattr(reader, "e_tag", None)
+            if not e_tag:
+                raise ValueError(
+                    f"record_etag=True, but the reader observed no ETag for "
+                    f"{filepath!r}: the store reports none, or the reader does not "
+                    "expose one as `e_tag` (obspec-utils readers do after 0.9.0)."
+                )
+            etags = {filepath: e_tag}
+
         # Several of our test fixtures which use xr.tutorial data have
         # non coord dimensions serialized using big endian dtypes which are not
         # yet supported in zarr-python v3.  We'll drop these variables for the
@@ -218,7 +237,7 @@ def _construct_manifest_group(
         drop_variables = set(drop_variables or ()) | set(non_coordinate_dimension_vars)
         group_name = str(g.name)  # NOTE: this will always include leading "/"
         arrays = {
-            key: _construct_manifest_array(filepath, dataset, group_name)
+            key: _construct_manifest_array(filepath, dataset, group_name, etags)
             for key in g.keys()
             if key not in drop_variables
             if isinstance(dataset := g[key], h5py.Dataset)
@@ -228,6 +247,7 @@ def _construct_manifest_group(
                 filepath,
                 reader,
                 group=str(Path(group) / key) if group is not None else key,
+                record_etag=record_etag,
             )
             for key in g.keys()
             if key not in drop_variables
@@ -253,6 +273,17 @@ class HDFParser:
         Must return an object implementing the
         [ReadableFile][obspec_utils.protocols.ReadableFile] protocol.
         Default is [BlockStoreReader][obspec_utils.readers.BlockStoreReader].
+    record_etag
+        Record the ETag the reader observed while parsing on every chunk manifest
+        ([ChunkManifest.etags][virtualizarr.manifests.ChunkManifest.etags]), so that
+        ``to_icechunk`` checks the references against it at read time. Requires a
+        reader exposing the ETag as ``e_tag`` (obspec-utils readers do after 0.9.0)
+        and a store that reports one; raises ``ValueError`` otherwise. To also
+        guarantee the parse itself read a single revision of the file, use a reader
+        that sends ``If-Match`` on every read, e.g.
+        ``functools.partial(BlockStoreReader, pin_etag=True)`` where supported.
+        Off by default: icechunk 2.2.0 rejects matching ETags for ``file://``
+        references (it strips the quotes its local backend compares against).
     """
 
     def __init__(
@@ -260,10 +291,12 @@ class HDFParser:
         group: str | None = None,
         drop_variables: Iterable[str] | None = None,
         reader_factory: ReaderFactory = BlockStoreReader,
+        record_etag: bool = False,
     ):
         self.group = group
         self.drop_variables = drop_variables
         self.reader_factory = reader_factory
+        self.record_etag = record_etag
 
     def __call__(
         self,
@@ -293,6 +326,7 @@ class HDFParser:
             reader=reader,
             group=self.group,
             drop_variables=self.drop_variables,
+            record_etag=self.record_etag,
         )
         # Convert to a manifest store
         return ManifestStore(registry=registry, group=manifest_group)
@@ -303,6 +337,7 @@ def _dataset_chunk_manifest(
     dataset: H5Dataset,
     *,
     chunks: tuple[int, ...],
+    etags: Mapping[str, str] | None = None,
 ) -> ChunkManifest:
     """
     Generate ChunkManifest for HDF5 dataset.
@@ -318,6 +353,8 @@ def _dataset_chunk_manifest(
         smaller than ``dataset.chunks`` when an oversized chunk has been trimmed
         to the array shape (see ``_chunk_shape``), in which case each chunk's
         byte length is recomputed for the trimmed, in-bounds region.
+    etags
+        Source object path -> ETag to record on the manifest.
 
     Returns
     -------
@@ -333,6 +370,7 @@ def _dataset_chunk_manifest(
                 paths=np.array(filepath, dtype=np.dtypes.StringDType),  # type: ignore
                 offsets=np.array(dsid.get_offset(), dtype=np.uint64),
                 lengths=np.array(dsid.get_storage_size(), dtype=np.uint64),
+                etags=etags,
             )
         else:
             key_list = [0] * (len(dataset.shape) or 1)
@@ -343,7 +381,7 @@ def _dataset_chunk_manifest(
             )
             chunk_key = ChunkKey(key)
             chunk_entries = {chunk_key: chunk_entry}
-            chunk_manifest = ChunkManifest(entries=chunk_entries)
+            chunk_manifest = ChunkManifest(entries=chunk_entries, etags=etags)
     else:
         num_chunks = dsid.get_num_chunks()
         if num_chunks == 0:
@@ -381,6 +419,7 @@ def _dataset_chunk_manifest(
                 paths=paths,  # type: ignore
                 offsets=offsets,
                 lengths=lengths,
+                etags=etags,
             )
     return chunk_manifest
 

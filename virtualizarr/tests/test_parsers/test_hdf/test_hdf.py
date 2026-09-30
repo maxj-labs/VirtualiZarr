@@ -1,3 +1,5 @@
+import functools
+import inspect
 import warnings
 
 import h5py  # type: ignore
@@ -5,10 +7,12 @@ import numpy as np
 import pytest
 import xarray as xr
 import zarr
+from obspec_utils.readers import BlockStoreReader
 from obspec_utils.registry import ObjectStoreRegistry
 from obstore.store import from_url
 
 from virtualizarr import open_virtual_dataset
+from virtualizarr.manifests import ManifestGroup
 from virtualizarr.parsers import HDFParser
 from virtualizarr.tests import (
     requires_hdf5plugin,
@@ -333,3 +337,81 @@ def test_fillvalue_runtime_error():
 
     result = _get_fill_value(dataset)
     assert result == np.ma.default_fill_value(dtype)
+
+
+class _ReaderWithETag(BlockStoreReader):
+    """Stands in for a reader that exposes the ETag it observed."""
+
+    e_tag: str | None = '"observed"'
+
+
+class _ReaderWithoutETag(BlockStoreReader):
+    e_tag = None
+
+
+def _all_manifests(group: ManifestGroup):
+    for array in group.arrays.values():
+        yield array.manifest
+    for subgroup in group.groups.values():
+        yield from _all_manifests(subgroup)
+
+
+class TestRecordsSourceETag:
+    def test_reader_etag_recorded_on_every_manifest(
+        self, nested_group_hdf5_url, local_registry
+    ):
+        store = HDFParser(reader_factory=_ReaderWithETag, record_etag=True)(
+            url=nested_group_hdf5_url, registry=local_registry
+        )
+        manifests = list(_all_manifests(store._group))
+        assert len(manifests) == 2  # group/data and group/nested_group/data
+        for manifest in manifests:
+            assert dict(manifest.etags) == {nested_group_hdf5_url: '"observed"'}
+
+    def test_nothing_recorded_by_default(self, nested_group_hdf5_url, local_registry):
+        store = HDFParser(reader_factory=_ReaderWithETag)(
+            url=nested_group_hdf5_url, registry=local_registry
+        )
+        assert all(not m.etags for m in _all_manifests(store._group))
+
+    def test_record_etag_raises_when_reader_has_none(
+        self, nested_group_hdf5_url, local_registry
+    ):
+        parser = HDFParser(reader_factory=_ReaderWithoutETag, record_etag=True)
+        with pytest.raises(ValueError, match="observed no ETag"):
+            parser(url=nested_group_hdf5_url, registry=local_registry)
+
+    @pytest.mark.skipif(
+        not hasattr(BlockStoreReader, "e_tag"),
+        reason="installed obspec-utils readers do not expose e_tag",
+    )
+    def test_default_reader_records_the_objects_etag(
+        self, nested_group_hdf5_url, local_registry
+    ):
+        store, path = local_registry.resolve(nested_group_hdf5_url)
+        expected = store.head(path)["e_tag"]
+
+        manifest_store = HDFParser(record_etag=True)(
+            url=nested_group_hdf5_url, registry=local_registry
+        )
+
+        for manifest in _all_manifests(manifest_store._group):
+            assert dict(manifest.etags) == {nested_group_hdf5_url: expected}
+
+    @pytest.mark.skipif(
+        "pin_etag" not in inspect.signature(BlockStoreReader).parameters,
+        reason="installed obspec-utils readers do not support pin_etag",
+    )
+    def test_parses_with_a_reader_pinned_to_one_revision(
+        self, nested_group_hdf5_url, local_registry
+    ):
+        pinned = functools.partial(BlockStoreReader, pin_etag=True)
+
+        manifest_store = HDFParser(reader_factory=pinned, record_etag=True)(
+            url=nested_group_hdf5_url, registry=local_registry
+        )
+
+        z = zarr.open_group(manifest_store, mode="r", zarr_format=3)
+        with h5py.File(nested_group_hdf5_url.removeprefix("file://"), mode="r") as f:
+            np.testing.assert_array_equal(f["group"]["data"], z["group"]["data"][...])
+        assert all(m.etags for m in _all_manifests(manifest_store._group))
