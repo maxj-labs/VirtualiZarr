@@ -534,38 +534,41 @@ def _dataset_chunk_manifest(
             chunk_entries = {chunk_key: chunk_entry}
             chunk_manifest = ChunkManifest(entries=chunk_entries)
     else:
+        grid_shape = tuple(math.ceil(a / b) for a, b in zip(dataset.shape, chunks))
+        paths = np.empty(grid_shape, dtype=np.dtypes.StringDType)
+        offsets = np.empty(grid_shape, dtype=np.uint64)
+        lengths = np.empty(grid_shape, dtype=np.uint64)
+
+        # When an oversized chunk has been trimmed the stored chunk holds
+        # more bytes than the in-bounds region, so use the trimmed chunk's
+        # byte size (valid because the trimmed region is a contiguous prefix
+        # of an unfiltered chunk - see _chunk_shape) rather than blob.size.
+        trimmed = chunks != dataset.chunks
+        trimmed_length = math.prod(chunks) * dataset.dtype.itemsize
+        num_chunks = 0
+
+        def get_key(blob):
+            return tuple(a // b for a, b in zip(blob.chunk_offset, chunks))
+
+        def add_chunk_info(blob):
+            nonlocal num_chunks
+            num_chunks += 1
+            key = get_key(blob)
+            paths[key] = filepath
+            offsets[key] = blob.byte_offset
+            lengths[key] = trimmed_length if trimmed else blob.size
+
+        # Fill the arrays during the single index walk rather than buffering
+        # the chunk records: a list of them costs a GC-tracked object per chunk.
         if callable(getattr(dsid, "chunk_iter", None)):
-            chunk_infos: list = []
-            dsid.chunk_iter(chunk_infos.append)
+            dsid.chunk_iter(add_chunk_info)
         else:
-            chunk_infos = [dsid.get_chunk_info(i) for i in range(dsid.get_num_chunks())]
-        if not chunk_infos:
+            for index in range(dsid.get_num_chunks()):
+                add_chunk_info(dsid.get_chunk_info(index))
+
+        if num_chunks == 0:
             chunk_manifest = ChunkManifest(entries={}, shape=dataset.shape)
         else:
-            grid_shape = tuple(math.ceil(a / b) for a, b in zip(dataset.shape, chunks))
-            paths = np.empty(grid_shape, dtype=np.dtypes.StringDType)
-            offsets = np.empty(grid_shape, dtype=np.uint64)
-            lengths = np.empty(grid_shape, dtype=np.uint64)
-
-            # When an oversized chunk has been trimmed the stored chunk holds
-            # more bytes than the in-bounds region, so use the trimmed chunk's
-            # byte size (valid because the trimmed region is a contiguous prefix
-            # of an unfiltered chunk - see _chunk_shape) rather than blob.size.
-            trimmed = chunks != dataset.chunks
-            trimmed_length = math.prod(chunks) * dataset.dtype.itemsize
-
-            def get_key(blob):
-                return tuple(a // b for a, b in zip(blob.chunk_offset, chunks))
-
-            def add_chunk_info(blob):
-                key = get_key(blob)
-                paths[key] = filepath
-                offsets[key] = blob.byte_offset
-                lengths[key] = trimmed_length if trimmed else blob.size
-
-            for chunk_info in chunk_infos:
-                add_chunk_info(chunk_info)
-
             chunk_manifest = ChunkManifest.from_arrays(
                 paths=paths,  # type: ignore
                 offsets=offsets,

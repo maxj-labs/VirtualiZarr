@@ -67,6 +67,10 @@
 
 ### Performance
 
+- `HDFParser` fills the chunk manifest arrays during its single index walk instead of first
+  collecting every chunk record in a list, which held about 240 MiB and cost about 0.6 s of
+  garbage collection per million chunks. By [Max Jones](https://github.com/maxrjones).
+
 - `HDFParser` now reads each chunked dataset's chunk index once instead of three times, cutting the requests needed
   to build a manifest by about two-thirds for files whose chunk index is larger than HDF5's metadata cache.
   By [Ian Hunt-Isaak](https://github.com/ianhi).
