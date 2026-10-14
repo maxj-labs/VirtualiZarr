@@ -67,6 +67,10 @@
 
 ### Performance
 
+- `ChunkManifest.from_arrays` normalizes each distinct chunk path once instead of once per chunk,
+  so building a manifest for an array with a million chunks spends about a tenth of the time on
+  path validation. By [Max Jones](https://github.com/maxrjones).
+
 - `HDFParser` now reads each chunked dataset's chunk index once instead of three times, cutting the requests needed
   to build a manifest by about two-thirds for files whose chunk index is larger than HDF5's metadata cache.
   By [Ian Hunt-Isaak](https://github.com/ianhi).

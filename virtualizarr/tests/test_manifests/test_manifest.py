@@ -262,6 +262,42 @@ class TestCreateFromArrays:
             paths=bad_paths, offsets=offsets, lengths=lengths, validate_paths=False
         )
 
+    def test_validate_paths_normalizes_each_distinct_path(self):
+        # paths are normalized per distinct value, so repeats, sentinels and
+        # already-normalized URIs must all land back in their own positions
+        paths = np.asarray(
+            [
+                ["/data/b.nc", "", "file:///data/a.nc"],
+                ["/data/a.nc", "/data/b.nc", "__inlined__"],
+            ],
+            dtype=np.dtypes.StringDType,
+        )
+        offsets = np.zeros(paths.shape, dtype=np.uint64)
+        lengths = np.ones(paths.shape, dtype=np.uint64)
+
+        manifest = ChunkManifest.from_arrays(
+            paths=paths, offsets=offsets, lengths=lengths, validate_paths=True
+        )
+
+        expected = np.asarray(
+            [
+                ["file:///data/b.nc", "", "file:///data/a.nc"],
+                ["file:///data/a.nc", "file:///data/b.nc", "__inlined__"],
+            ],
+            dtype=np.dtypes.StringDType,
+        )
+        np.testing.assert_array_equal(manifest._paths, expected)
+
+        # a scalar dataset has a 0-d paths array
+        scalar = ChunkManifest.from_arrays(
+            paths=np.array("/data/a.nc", dtype=np.dtypes.StringDType),
+            offsets=np.array(0, dtype=np.uint64),
+            lengths=np.array(1, dtype=np.uint64),
+            validate_paths=True,
+        )
+        assert scalar._paths.shape == ()
+        assert scalar._paths[()] == "file:///data/a.nc"
+
 
 class TestZeroLengthChunks:
     """Zero-length chunk references are always invalid - a chunk can never decode to

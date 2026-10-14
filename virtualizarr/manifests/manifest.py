@@ -393,10 +393,15 @@ class ChunkManifest:
                 )
 
         if validate_paths:
-            vectorized_validation_fn = np.vectorize(
-                validate_and_normalize_path_to_uri, otypes=[np.dtypes.StringDType()]
-            )  # type: ignore[attr-defined]
-            paths = vectorized_validation_fn(paths)
+            # A manifest usually holds a handful of distinct paths repeated over
+            # millions of chunks, so normalize each distinct path once.
+            unique_paths, inverse = np.unique(paths, return_inverse=True)
+            normalized = np.array(
+                [validate_and_normalize_path_to_uri(p) for p in unique_paths],
+                dtype=np.dtypes.StringDType(),  # type: ignore[attr-defined]
+            )
+            # ravel keeps a 0-d paths array (scalar dataset) an array
+            paths = normalized[inverse.ravel()].reshape(paths.shape)  # type: ignore[assignment]
 
         obj = object.__new__(cls)
         obj._paths = paths
