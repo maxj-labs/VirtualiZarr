@@ -16,7 +16,7 @@ from zarr.core.metadata import ArrayV3Metadata
 from zarr.core.metadata.v2 import ArrayV2Metadata
 from zarr.dtype import parse_data_type
 
-from virtualizarr.manifests import ManifestArray
+from virtualizarr.manifests import ConcatenatedManifestArray, ManifestArray
 from virtualizarr.manifests.manifest import join
 from virtualizarr.manifests.utils import create_v3_array_metadata
 from virtualizarr.types.kerchunk import KerchunkArrRefs, KerchunkStoreRefs
@@ -163,6 +163,11 @@ def variable_to_kerchunk_arr_refs(
     """
     array_v3_metadata: ArrayV3Metadata | None = None
 
+    if isinstance(var.data, ConcatenatedManifestArray):
+        raise NotImplementedError(
+            "A ConcatenatedManifestArray cannot be written as kerchunk references, which "
+            "describe one chunk grid and one codec chain per array. Write it to Icechunk."
+        )
     if isinstance(var.data, ManifestArray):
         marr = var.data
 

@@ -4,6 +4,7 @@ from virtualizarr.accessor import (
     VirtualiZarrDatasetAccessor,
     VirtualiZarrDataTreeAccessor,
 )
+from virtualizarr.options import set_options
 from virtualizarr.xarray import (
     open_virtual_dataset,
     open_virtual_datatree,
@@ -23,4 +24,5 @@ __all__ = [
     "open_virtual_dataset",
     "open_virtual_mfdataset",
     "open_virtual_datatree",
+    "set_options",
 ]

@@ -19,6 +19,7 @@ from .utils import (
 
 if TYPE_CHECKING:
     from .array import ManifestArray
+    from .concat import ConcatenatedManifestArray
 
 
 MANIFESTARRAY_HANDLED_ARRAY_FUNCTIONS: dict[
@@ -49,15 +50,17 @@ def result_type(*arrays_and_dtypes: Union["ManifestArray", np.dtype]) -> np.dtyp
     array's native dtype and declared fill value through a reindex.
     """
     from virtualizarr.manifests.array import ManifestArray
+    from virtualizarr.manifests.concat import ConcatenatedManifestArray
 
+    virtual = (ManifestArray, ConcatenatedManifestArray)
     manifest_dtypes = [
-        obj.dtype for obj in arrays_and_dtypes if isinstance(obj, ManifestArray)
+        obj.dtype for obj in arrays_and_dtypes if isinstance(obj, virtual)
     ]
     if len(manifest_dtypes) == 1:
         return manifest_dtypes[0]
 
     dtypes = [
-        obj.dtype if isinstance(obj, ManifestArray) else np.dtype(obj)
+        obj.dtype if isinstance(obj, virtual) else np.dtype(obj)
         for obj in arrays_and_dtypes
     ]
     first_dtype, *other_dtypes = dtypes
@@ -112,14 +115,16 @@ def concatenate(
     /,
     *,
     axis: int | None = 0,
-) -> "ManifestArray":
+) -> Union["ManifestArray", "ConcatenatedManifestArray"]:
     """
     Concatenate ManifestArrays by merging their chunk manifests.
 
     The signature of this function is array API compliant, so that it can be called by `xarray.concat`.
-    """
 
-    from .array import ManifestArray
+    Arrays that cannot share one chunk grid raise an error, or, inside
+    ``virtualizarr.set_options(mismatched_concat="pieces")``, are kept as the pieces of a
+    [ConcatenatedManifestArray][virtualizarr.manifests.ConcatenatedManifestArray].
+    """
 
     if axis is None:
         raise NotImplementedError(
@@ -128,15 +133,33 @@ def concatenate(
     elif not isinstance(axis, int):
         raise TypeError()
 
+    from virtualizarr.options import OPTIONS
+
+    from .concat import ConcatenatedManifestArray, concatenate_keeping_pieces
+
+    # Ensure we handle axis being passed as a negative integer
+    if axis < 0:
+        axis = axis % arrays[0].ndim
+
+    if OPTIONS["mismatched_concat"] == "pieces" or any(
+        isinstance(arr, ConcatenatedManifestArray) for arr in arrays
+    ):
+        return concatenate_keeping_pieces(arrays, axis, merge=_concatenate_as_one_array)
+    return _concatenate_as_one_array(arrays, axis)
+
+
+def _concatenate_as_one_array(
+    arrays: tuple["ManifestArray", ...] | list["ManifestArray"], axis: int
+) -> "ManifestArray":
+    """Concatenate ManifestArrays that share a chunk grid and codecs into one ManifestArray."""
+    from .array import ManifestArray
+
     # ensure dtypes, shapes, codecs etc. are consistent
     check_combinable_zarr_arrays(arrays)
 
     check_same_ndims([arr.ndim for arr in arrays])
 
-    # Ensure we handle axis being passed as a negative integer
     first_arr = arrays[0]
-    if axis < 0:
-        axis = axis % first_arr.ndim
 
     arr_shapes = [arr.shape for arr in arrays]
     arr_chunks = [manifest_chunk_shape(arr.metadata) for arr in arrays]

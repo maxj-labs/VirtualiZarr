@@ -149,7 +149,12 @@ class ManifestArray:
         # also permitted among the argument types because some handled functions
         # legitimately mix them with ManifestArrays — e.g. np.where, whose boolean
         # condition arrives as an ndarray during xarray's reindex/alignment fill.
-        if not all(issubclass(t, (ManifestArray, np.ndarray)) for t in types):
+        from virtualizarr.manifests.concat import ConcatenatedManifestArray
+
+        if not all(
+            issubclass(t, (ManifestArray, ConcatenatedManifestArray, np.ndarray))
+            for t in types
+        ):
             return NotImplemented
 
         return MANIFESTARRAY_HANDLED_ARRAY_FUNCTIONS[func](*args, **kwargs)

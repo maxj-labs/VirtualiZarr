@@ -14,7 +14,7 @@ from typing import (
 
 import xarray as xr
 
-from virtualizarr.manifests import ManifestArray
+from virtualizarr.manifests import ConcatenatedManifestArray, ManifestArray
 from virtualizarr.types.kerchunk import KerchunkStoreRefs
 from virtualizarr.writers.kerchunk import dataset_to_kerchunk_refs
 
@@ -34,7 +34,10 @@ def warn_if_not_virtual(cls_name: Literal["Dataset", "DataTree"]):
                 case "DataTree":
                     all_vars = all_datatree_variables(self.dt)
 
-            if not any(isinstance(var._data, ManifestArray) for var in all_vars):
+            if not any(
+                isinstance(var._data, (ManifestArray, ConcatenatedManifestArray))
+                for var in all_vars
+            ):
                 warnings.warn(
                     f"Attempting to write an entirely non-virtual {cls_name} to a virtual references format - i.e. your `xarray.{cls_name}` contains zero `ManifestArray` objects. "
                     "This is almost certainly not intended, as the entire data contents will be duplicated rather than referenced. "
@@ -298,7 +301,7 @@ class _VirtualiZarrDatasetAccessor:
         new_ds = self.ds.copy()
         for var_name in new_ds.variables:
             data = new_ds[var_name].data
-            if isinstance(data, ManifestArray):
+            if isinstance(data, (ManifestArray, ConcatenatedManifestArray)):
                 new_ds[var_name].data = data.rename_paths(new=new)
 
         return new_ds
@@ -316,7 +319,7 @@ class _VirtualiZarrDatasetAccessor:
         """
         return sum(
             var._data.nbytes_virtual
-            if isinstance(var._data, ManifestArray)
+            if isinstance(var._data, (ManifestArray, ConcatenatedManifestArray))
             else var.nbytes
             for var in self.ds.variables.values()
         )
@@ -341,6 +344,8 @@ class _VirtualiZarrDatasetAccessor:
             data = var._data
             if isinstance(data, ManifestArray):
                 total += len(data.manifest)
+            elif isinstance(data, ConcatenatedManifestArray):
+                total += sum(len(piece.manifest) for piece in data.pieces)
         return total
 
 

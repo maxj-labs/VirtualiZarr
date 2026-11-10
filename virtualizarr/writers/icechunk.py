@@ -15,7 +15,11 @@ from zarr.core.metadata.v3 import ArrayV3Metadata
 from zarr.core.sync import sync
 
 from virtualizarr.codecs import extract_codecs, get_codecs
-from virtualizarr.manifests import ChunkManifest, ManifestArray
+from virtualizarr.manifests import (
+    ChunkManifest,
+    ConcatenatedManifestArray,
+    ManifestArray,
+)
 from virtualizarr.manifests.manifest import INLINED_CHUNK_PATH
 from virtualizarr.manifests.utils import (
     check_compatible_encodings,
@@ -311,10 +315,10 @@ def validate_virtual_chunk_containers(
     """Check that all virtual refs have corresponding virtual chunk containers, before writing any of the refs."""
 
     manifestarrays = [
-        var.data
+        marr
         for dataset in virtual_datasets
         for var in dataset.variables.values()
-        if isinstance(var.data, ManifestArray)
+        for marr in _manifest_arrays(var.data)
     ]
 
     # get the prefixes of all virtual chunk containers
@@ -359,7 +363,7 @@ def write_virtual_dataset_to_icechunk_group(
     virtual_variables = {
         name: var
         for name, var in vds.variables.items()
-        if isinstance(var.data, ManifestArray)
+        if isinstance(var.data, (ManifestArray, ConcatenatedManifestArray))
     }
 
     loadable_variables = {
@@ -389,6 +393,17 @@ def write_virtual_dataset_to_icechunk_group(
 
     # Then write the virtual variables to the same group
     for name, var in virtual_variables.items():
+        if isinstance(var.data, ConcatenatedManifestArray):
+            write_concatenated_variable_to_icechunk(
+                store=store,
+                group=group,
+                name=name,  # type: ignore[arg-type]
+                var=var,
+                append_dim=append_dim,
+                region=region,
+                last_updated_at=last_updated_at,
+            )
+            continue
         write_virtual_variable_to_icechunk(
             store=store,
             group=group,
@@ -600,6 +615,85 @@ def write_virtual_variable_to_icechunk(
         chunk_index_offsets=tuple(chunk_offsets),
         last_updated_at=last_updated_at,
     )
+
+
+PIECES_GROUP = "_pieces"
+"""The child group that holds the pieces of a group's concatenated variables."""
+
+
+def _manifest_arrays(data: object) -> tuple[ManifestArray, ...]:
+    """The ManifestArrays behind a variable's data: itself, its pieces, or none."""
+    if isinstance(data, ManifestArray):
+        return (data,)
+    if isinstance(data, ConcatenatedManifestArray):
+        return data.pieces
+    return ()
+
+
+def write_concatenated_variable_to_icechunk(
+    store: "IcechunkStore",
+    group: "Group",
+    name: str,
+    var: xr.Variable,
+    append_dim: Optional[str] = None,
+    region: Optional[Mapping[str, slice]] = None,
+    last_updated_at: Optional[datetime] = None,
+) -> None:
+    """
+    Write a variable whose data is a ConcatenatedManifestArray into an icechunk store.
+
+    Every piece becomes a virtual array at ``_pieces/<name>/<i>`` under the group, and
+    the variable becomes an array with no chunks whose ``array_concat`` codec reads them.
+    """
+    try:
+        from zarr.codecs import ArrayConcatCodec  # type: ignore[attr-defined]
+    except ImportError as err:
+        raise ImportError(
+            f"Variable {name!r} joins arrays that cannot share one chunk grid, which needs "
+            "the `array_concat` codec. The installed zarr-python does not have it."
+        ) from err
+
+    if append_dim is not None or region is not None:
+        raise NotImplementedError(
+            f"Variable {name!r} is a ConcatenatedManifestArray, which cannot be appended "
+            "or written to a region."
+        )
+    if isinstance(group.get(name), Array):
+        raise NotImplementedError(
+            f"Variable {name!r} is a ConcatenatedManifestArray and the array {name!r} "
+            "already exists. Write to a new group or store."
+        )
+
+    cma = cast(ConcatenatedManifestArray, var.data)
+    pieces_group = group.require_group(f"{PIECES_GROUP}/{name}")
+    for i, piece in enumerate(cma.pieces):
+        write_virtual_variable_to_icechunk(
+            store=store,
+            group=pieces_group,
+            name=str(i),
+            var=xr.Variable(var.dims, piece, attrs=var.attrs, encoding=var.encoding),
+            last_updated_at=last_updated_at,
+        )
+
+    first = cma.pieces[0].metadata
+    arr = group.require_array(
+        name=name,
+        shape=cma.shape,
+        chunks=cma.shape,
+        dtype=first.data_type.to_native_dtype(),
+        filters=None,
+        compressors=None,
+        serializer=ArrayConcatCodec(
+            axis=cma.axis,
+            pieces=[
+                {"path": f"../{PIECES_GROUP}/{name}/{i}", "size": piece.shape[cma.axis]}
+                for i, piece in enumerate(cma.pieces)
+            ],
+        ),
+        dimension_names=var.dims,
+        fill_value=first.fill_value,
+    )
+    update_attributes(arr, var.attrs, encoding=var.encoding)
 
 
 def _check_existing_array_matches(
