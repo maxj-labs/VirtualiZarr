@@ -457,3 +457,89 @@ def test_append_to_a_joined_array(tmp_path: Path, layouts: str, select: str):
     # by position: one case per run of chunks. By key: one per distinct layout, and
     # the first and last files share theirs.
     assert len(configuration["cases"]) == (4 if select == "position" else 3)
+
+
+@requires_hdf5plugin
+@requires_icechunk
+@pytest.mark.parametrize("layouts", ["same chunk shape", "chunk shape changes"])
+@pytest.mark.parametrize("select", ["position", "key"])
+def test_unwritten_chunks_read_as_their_own_files_fill_value(
+    tmp_path: Path, layouts: str, select: str
+):
+    """Files that leave chunks unwritten and declare different fill values."""
+    import h5py
+    import icechunk
+
+    from virtualizarr.manifests.plan import plan_joined_array
+    from virtualizarr.parsers import HDFParser
+    from virtualizarr.writers.icechunk import _icechunk_takes_parts, _write_literals
+
+    if (
+        layouts == "chunk shape changes" or select == "key"
+    ) and not _icechunk_takes_parts():
+        pytest.skip("needs an Icechunk whose references take a prefix and more ranges")
+    from zarr.codecs import SwitchCodec  # type: ignore[attr-defined]
+
+    rng = np.random.default_rng(7)
+    second = (2, 12, 10) if layouts == "same chunk shape" else (4, 6, 5)
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    pieces, expected = [], []
+    for i, (fill, written, chunks) in enumerate(
+        [(-9999.0, 6, (2, 12, 10)), (-1.0, 4, second)]
+    ):
+        path = tmp_path / f"f{i}.h5"
+        with h5py.File(path, "w") as h:
+            v = h.create_dataset(
+                "v",
+                shape=(8, 12, 10),
+                dtype="f4",
+                chunks=chunks,
+                fillvalue=fill,
+                compression="gzip",
+            )
+            v[:written] = rng.normal(size=(written, 12, 10)).astype("f4")
+            expected.append(v[...])
+        pieces.append(
+            HDFParser()(url=f"file://{path}", registry=registry)._group.arrays["v"]
+        )
+
+    plan = plan_joined_array(pieces, axis=0, select=select)
+    assert plan.notes["pieces_with_their_own_fill"] == 1
+    assert bool(plan.literals) == (select == "key")
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            url_prefix=PYTEST_TMP_DIRECTORY_URL_PREFIX,
+            store=icechunk.local_filesystem_store(PYTEST_TMP_DIRECTORY_URL_PREFIX),
+        )
+    )
+    repo = icechunk.Repository.create(
+        storage=icechunk.Storage.new_in_memory(),
+        config=config,
+        authorize_virtual_chunk_access={PYTEST_TMP_DIRECTORY_URL_PREFIX: None},
+    )
+    session = repo.writable_session("main")
+    with zarr.config.set({"array.rectilinear_chunks": True}):
+        zarr.create_array(
+            session.store,
+            name="v",
+            shape=plan.shape,
+            chunks=plan.chunk_grid,
+            dtype=plan.dtype,
+            fill_value=plan.fill_value,
+            serializer=SwitchCodec(
+                axis=0, cases=plan.cases, select=select, key_bytes=plan.key_bytes
+            ),
+            compressors=None,
+            filters=None,
+        )
+        session.store.set_virtual_refs(
+            "v", [icechunk.VirtualChunkSpec(**r) for r in plan.refs]
+        )
+        _write_literals(session.store, "v", plan.literals)
+        session.commit("x")
+        array = zarr.open_array(repo.readonly_session("main").store, path="v")
+        np.testing.assert_array_equal(array[...], np.concatenate(expected))
+        np.testing.assert_array_equal(
+            array[5:14, 3:9, 2:7], np.concatenate(expected)[5:14, 3:9, 2:7]
+        )

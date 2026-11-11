@@ -778,11 +778,32 @@ def append_to_joined_array(
                 )
             )
         failed = store.set_virtual_refs(key_prefix, refs, validate_containers=True)
+        _write_literals(store, key_prefix, plan.literals, axis, existing_chunks)
     if failed:
         raise ValueError(
             f"{len(failed)} references of variable {name!r} are outside the "
             "repository's virtual chunk containers."
         )
+
+
+def _write_literals(
+    store: "IcechunkStore",
+    key_prefix: str,
+    literals: list[dict],
+    axis: int = 0,
+    offset: int = 0,
+) -> None:
+    """Write a plan's literal chunks: the few bytes that name the case of a chunk which
+    stores nothing else."""
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.sync import sync
+
+    proto = default_buffer_prototype()
+    for literal in literals:
+        index = list(literal["index"])
+        index[axis] += offset
+        key = f"{key_prefix}/c/" + "/".join(str(i) for i in index)
+        sync(store.set(key, proto.buffer.from_bytes(literal["data"])))
 
 
 def _icechunk_takes_parts() -> bool:
@@ -918,6 +939,7 @@ def write_concatenated_variable_to_icechunk(
                     f"{len(failed)} references of variable {name!r} are outside the "
                     "repository's virtual chunk containers."
                 )
+            _write_literals(store, key_prefix.lstrip("/"), plan.literals)
             update_attributes(arr, var.attrs, encoding=var.encoding)
         return
 

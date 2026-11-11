@@ -47,6 +47,10 @@ class JoinedArrayPlan:
     chunk_grid: list[list[int]]
     cases: list[dict]
     refs: list[dict] = field(default_factory=list)
+    # With select="key": chunks that store nothing in a piece whose fill value is not the
+    # array's. Each is written as an ordinary chunk holding only its case's key (and, in
+    # a shard, an index that lists nothing), so that it reads as the case's fill value.
+    literals: list[dict] = field(default_factory=list)
     source_chunks: int = 0
     notes: dict = field(default_factory=dict)
     select: str = "position"
@@ -168,12 +172,6 @@ def plan_joined_array(
             (p.manifest._paths != "").all()
         ):
             return {}
-        if select == "key":
-            # a chunk that stores nothing has no reference to carry a key
-            raise NotImplementedError(
-                "a piece leaves chunks unstored and its fill value is not the array's; "
-                "that needs select='position'"
-            )
         notes["pieces_with_their_own_fill"] += 1
         return {"fill_value": zdtype.to_json_scalar(fill, zarr_format=3)}
 
@@ -217,16 +215,18 @@ def plan_joined_array(
                 # every chunk is whole: as large as its place. (By key the shape is
                 # spelled out, so pieces with and without a cut chunk share a case.)
                 encoded[axis] = None
+            own = own_fill(p, fill)
             key = add_case(
                 len(along),
-                {
-                    "codecs": codecs_of(p),
-                    "encoded_chunk_shape": encoded,
-                    **own_fill(p, fill),
-                },
+                {"codecs": codecs_of(p), "encoded_chunk_shape": encoded, **own},
             )
             grid[axis] += along
             paths, offsets, lengths = paths_of(p)
+            if key and own:
+                for idx in zip(*np.nonzero(paths == "")):
+                    index = [int(i) for i in idx]
+                    index[axis] += base
+                    out.literals.append({"index": index, "data": key})
             for idx in zip(*np.nonzero(paths != "")):
                 index = [int(i) for i in idx]
                 index[axis] += base
@@ -314,13 +314,14 @@ def plan_joined_array(
             },
         }
         # Neighbours in a virtual shard are separate source chunks, so ranges are never merged.
+        own = own_fill(p, fill)
         key = add_case(
             len(along),
             {
                 "codecs": [sharding],
                 "encoded_chunk_shape": encoded_shape,
                 "coalesce_max_gap_bytes": 0,
-                **own_fill(p, fill),
+                **own,
             },
         )
         grid[axis] += along
@@ -336,6 +337,10 @@ def plan_joined_array(
                     index[inner] = (pos, n)
                     parts.append((str(paths[src]), int(offsets[src]), n))
                     pos += n
+            if key and own and not parts:
+                where = [int(i) for i in s]
+                where[axis] += base
+                out.literals.append({"index": where, "data": key + index.tobytes()})
             if parts:
                 where = [int(i) for i in s]
                 where[axis] += base
