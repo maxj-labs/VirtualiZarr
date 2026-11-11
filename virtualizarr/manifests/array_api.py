@@ -63,6 +63,11 @@ def result_type(*arrays_and_dtypes: Union["ManifestArray", np.dtype]) -> np.dtyp
         obj.dtype if isinstance(obj, virtual) else np.dtype(obj)
         for obj in arrays_and_dtypes
     ]
+    from virtualizarr.options import OPTIONS
+
+    if OPTIONS["mismatched_concat"] == "pieces":
+        # pieces may store different types; the joined array has the common one
+        return np.dtype(np.result_type(*dtypes))
     first_dtype, *other_dtypes = dtypes
     unique_dtypes = set(dtypes)
     for other_dtype in other_dtypes:
@@ -201,6 +206,16 @@ def stack(
 
     if not isinstance(axis, int):
         raise TypeError()
+
+    from virtualizarr.options import OPTIONS
+
+    if OPTIONS["mismatched_concat"] == "pieces" and len(arrays) > 1:
+        try:
+            check_combinable_zarr_arrays(arrays)
+        except (ValueError, NotImplementedError):
+            # arrays that cannot share a chunk grid: give each the new axis, then
+            # join them along it, keeping the ones that do not merge as pieces
+            return concatenate([stack([arr], axis=axis) for arr in arrays], axis=axis)  # type: ignore[return-value]
 
     # ensure dtypes, shapes, codecs etc. are consistent
     check_combinable_zarr_arrays(arrays)

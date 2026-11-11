@@ -153,12 +153,15 @@ def test_icechunk_roundtrip(years, tmp_path: Path):
     vds.vz.to_icechunk(session.store)
     session.commit("daymet-like store")
 
+    zarr.config.set({"array.rectilinear_chunks": True})
     store = repo.readonly_session("main").store
     array = zarr.open_array(store, path="tmin", mode="r")
     assert array.shape == (5 * NT, NY, NX)
-    assert [codec["name"] for codec in array.metadata.to_dict()["codecs"]] == [
-        "array_concat"
-    ]
+    # virtual shards where Icechunk can store them, pieces joined by a codec otherwise
+    assert [codec["name"] for codec in array.metadata.to_dict()["codecs"]] in (
+        ["switch"],
+        ["array_concat"],
+    )
 
     with xr.open_zarr(store, consolidated=False, chunks=None) as actual:
         assert list(actual.data_vars) == ["tmin"]
@@ -173,3 +176,136 @@ def test_icechunk_roundtrip(years, tmp_path: Path):
             actual["tmin"].isel(time=slice(3 * NT - 2, 3 * NT + 12)).values,
             expected["tmin"].isel(time=slice(3 * NT - 2, 3 * NT + 12)),
         )
+
+
+def _roundtrip(vds: xr.Dataset) -> "zarr.abc.store.Store":
+    import icechunk
+
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            url_prefix=PYTEST_TMP_DIRECTORY_URL_PREFIX,
+            store=icechunk.local_filesystem_store(PYTEST_TMP_DIRECTORY_URL_PREFIX),
+        )
+    )
+    repo = icechunk.Repository.create(
+        storage=icechunk.Storage.new_in_memory(),
+        config=config,
+        authorize_virtual_chunk_access={PYTEST_TMP_DIRECTORY_URL_PREFIX: None},
+    )
+    session = repo.writable_session("main")
+    vds.vz.to_icechunk(session.store)
+    session.commit("joined")
+    zarr.config.set({"array.rectilinear_chunks": True})
+    return repo.readonly_session("main").store
+
+
+def _write(path: Path, data: np.ndarray, *, t0: int = 0, **encoding) -> xr.Dataset:
+    ds = xr.Dataset(
+        {"v": (("time", "y", "x"), data)},
+        coords={"time": ("time", np.arange(data.shape[0], dtype="float64") + t0)},
+    )
+    ds.to_netcdf(path, engine="netcdf4", encoding={"v": encoding})
+    return ds
+
+
+@requires_hdf5plugin
+@requires_icechunk
+def test_same_chunk_shape_is_one_array_of_plain_chunks(tmp_path: Path):
+    """A codec change and a cut last chunk need no shards: every source chunk is one
+    Zarr chunk, with released Icechunk."""
+    rng = np.random.default_rng(0)
+    layouts = [
+        dict(chunksizes=(4, 6, 5), zlib=True, shuffle=False),
+        dict(chunksizes=(4, 6, 5), zlib=True, shuffle=True),  # 10 steps: cut last chunk
+        dict(chunksizes=(4, 6, 5), zlib=False),
+    ]
+    paths, datasets, t0 = [], [], 0
+    for i, (n, encoding) in enumerate(zip((8, 10, 7), layouts)):
+        data = rng.normal(size=(n, 12, 10)).astype("float32")
+        paths.append(str(tmp_path / f"f{i}.nc"))
+        datasets.append(_write(Path(paths[-1]), data, t0=t0, **encoding))
+        t0 += n
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    from virtualizarr.parsers import HDFParser
+
+    vdss = [
+        open_virtual_dataset(
+            url=p, registry=registry, parser=HDFParser(), loadable_variables=["time"]
+        )
+        for p in paths
+    ]
+    with virtualizarr.set_options(mismatched_concat="pieces"):
+        vds = xr.concat(vdss, dim="time", coords="minimal", compat="override")
+    store = _roundtrip(vds)
+    array = zarr.open_array(store, path="v", mode="r")
+    codec = array.metadata.to_dict()["codecs"][0]
+    assert codec["name"] == "switch"
+    assert [case["chunks"] for case in codec["configuration"]["cases"]] == [2, 3, 2]
+    expected = np.concatenate([d["v"].values for d in datasets])
+    np.testing.assert_array_equal(array[:], expected)
+    np.testing.assert_array_equal(array[6:20, 3:9, ::2], expected[6:20, 3:9, ::2])
+
+
+@requires_hdf5plugin
+@requires_icechunk
+def test_data_type_change(tmp_path: Path):
+    """int16 in one file and float32 in the next read as one float32 array."""
+    pytest.importorskip("cast_value_rs")
+    rng = np.random.default_rng(1)
+    a = rng.integers(-500, 500, size=(4, 6, 5)).astype("int16")
+    b = rng.normal(size=(4, 6, 5)).astype("float32")
+    _write(tmp_path / "a.nc", a, chunksizes=(2, 6, 5), zlib=True)
+    _write(tmp_path / "b.nc", b, t0=4, chunksizes=(2, 6, 5), zlib=True)
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    from virtualizarr.parsers import HDFParser
+
+    vdss = [
+        open_virtual_dataset(
+            url=str(tmp_path / f),
+            registry=registry,
+            parser=HDFParser(),
+            loadable_variables=["time"],
+        )
+        for f in ("a.nc", "b.nc")
+    ]
+    with pytest.raises((ValueError, NotImplementedError)):
+        xr.concat(vdss, dim="time", coords="minimal", compat="override")
+    with virtualizarr.set_options(mismatched_concat="pieces"):
+        vds = xr.concat(vdss, dim="time", coords="minimal", compat="override")
+    assert vds["v"].dtype == np.float32
+    array = zarr.open_array(_roundtrip(vds), path="v", mode="r")
+    assert array.dtype == np.float32
+    np.testing.assert_array_equal(array[:], np.concatenate([a.astype("float32"), b]))
+
+
+@requires_hdf5plugin
+@requires_icechunk
+def test_stacking_files_without_the_joined_axis(tmp_path: Path):
+    """Daily maps with no time axis, stacked along a new one, with a codec change."""
+    rng = np.random.default_rng(2)
+    maps = [rng.normal(size=(12, 10)).astype("float32") for _ in range(4)]
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    from virtualizarr.parsers import HDFParser
+
+    vdss = []
+    for i, m in enumerate(maps):
+        path = tmp_path / f"day{i}.nc"
+        xr.Dataset({"v": (("y", "x"), m)}).to_netcdf(
+            path,
+            engine="netcdf4",
+            encoding={"v": dict(chunksizes=(6, 5), zlib=True, shuffle=i >= 2)},
+        )
+        vdss.append(
+            open_virtual_dataset(
+                url=str(path),
+                registry=registry,
+                parser=HDFParser(),
+                loadable_variables=[],
+            )
+        )
+    with virtualizarr.set_options(mismatched_concat="pieces"):
+        vds = xr.concat(vdss, dim="day", coords="minimal", compat="override")
+    assert vds["v"].shape == (4, 12, 10)
+    array = zarr.open_array(_roundtrip(vds), path="v", mode="r")
+    np.testing.assert_array_equal(array[:], np.stack(maps))

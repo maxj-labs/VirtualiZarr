@@ -5,7 +5,6 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence, Union
 import numpy as np
 
 from virtualizarr.manifests.utils import (
-    check_same_dtypes,
     check_same_ndims,
     check_same_shapes_except_on_concat_axis,
     get_codecs,
@@ -43,18 +42,22 @@ class ConcatenatedManifestArray:
         The axis along which the pieces are joined.
     """
 
-    def __init__(self, pieces: Sequence["ManifestArray"], axis: int) -> None:
+    def __init__(
+        self,
+        pieces: Sequence["ManifestArray"],
+        axis: int,
+        dtype: np.dtype | None = None,
+    ) -> None:
         from virtualizarr.manifests.array import ManifestArray
 
         pieces = tuple(pieces)
-        if len(pieces) < 2:
-            raise ValueError("A ConcatenatedManifestArray has at least two pieces.")
+        if not pieces:
+            raise ValueError("A ConcatenatedManifestArray has at least one piece.")
         for piece in pieces:
             if not isinstance(piece, ManifestArray):
                 raise TypeError(
                     f"Every piece must be a ManifestArray. Got {type(piece)}."
                 )
-        check_same_dtypes([piece.dtype for piece in pieces])
         check_same_ndims([piece.ndim for piece in pieces])
         if not 0 <= axis < pieces[0].ndim:
             raise ValueError(
@@ -63,6 +66,10 @@ class ConcatenatedManifestArray:
         check_same_shapes_except_on_concat_axis([piece.shape for piece in pieces], axis)
         self._pieces = pieces
         self._axis = axis
+        # the type the values are read as: by default the one every piece converts to
+        self._dtype = np.dtype(
+            dtype if dtype is not None else np.result_type(*[p.dtype for p in pieces])
+        )
 
     @property
     def pieces(self) -> tuple["ManifestArray", ...]:
@@ -74,7 +81,8 @@ class ConcatenatedManifestArray:
 
     @property
     def dtype(self) -> np.dtype:
-        return self._pieces[0].dtype
+        """The type every piece's values convert to (pieces may store different types)."""
+        return self._dtype
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -138,9 +146,11 @@ class ConcatenatedManifestArray:
         self, dtype: np.dtype, /, *, copy: bool = True
     ) -> "ConcatenatedManifestArray":
         """Cannot change the dtype, but xarray calls this even when it is a no-op."""
-        if not np.issubdtype(self.dtype, dtype):
-            raise NotImplementedError()
-        return self
+        if np.dtype(dtype) == self.dtype:
+            return self
+        return ConcatenatedManifestArray(
+            self._pieces, self._axis, dtype=np.dtype(dtype)
+        )
 
     def __getitem__(self, key: Any, /) -> "ConcatenatedManifestArray":
         keys = key if isinstance(key, tuple) else (key,)
@@ -156,7 +166,9 @@ class ConcatenatedManifestArray:
     ) -> "ConcatenatedManifestArray":
         """Rename the paths to chunks in every piece's manifest."""
         return ConcatenatedManifestArray(
-            [piece.rename_paths(new) for piece in self._pieces], axis=self._axis
+            [piece.rename_paths(new) for piece in self._pieces],
+            axis=self._axis,
+            dtype=self._dtype,
         )
 
 
@@ -168,6 +180,8 @@ def _same_fill_value(a: Any, b: Any) -> bool:
 def _can_extend(run: list["ManifestArray"], nxt: "ManifestArray", axis: int) -> bool:
     """Whether `nxt` can be merged onto the end of `run` as one Zarr array."""
     first, last = run[0], run[-1]
+    if first.dtype != nxt.dtype:
+        return False
     if get_codecs(first) != get_codecs(nxt):
         return False
     if manifest_chunk_shape(first.metadata) != manifest_chunk_shape(nxt.metadata):
@@ -203,7 +217,7 @@ def concatenate_keeping_pieces(
     flat: list["ManifestArray"] = []
     for arr in arrays:
         if isinstance(arr, ConcatenatedManifestArray):
-            if arr.axis != axis:
+            if arr.axis != axis and len(arr.pieces) > 1:
                 raise NotImplementedError(
                     f"Cannot concatenate along axis {axis} an array whose pieces are "
                     f"joined along axis {arr.axis}."
@@ -212,7 +226,6 @@ def concatenate_keeping_pieces(
         else:
             flat.append(arr)
 
-    check_same_dtypes([arr.dtype for arr in flat])
     check_same_ndims([arr.ndim for arr in flat])
     check_same_shapes_except_on_concat_axis([arr.shape for arr in flat], axis)
 
@@ -224,6 +237,7 @@ def concatenate_keeping_pieces(
             runs.append([arr])
 
     merged = [run[0] if len(run) == 1 else merge(run, axis) for run in runs]
-    if len(merged) == 1:
+    dtype = np.dtype(np.result_type(*[arr.dtype for arr in arrays]))
+    if len(merged) == 1 and merged[0].dtype == dtype:
         return merged[0]
-    return ConcatenatedManifestArray(merged, axis=axis)
+    return ConcatenatedManifestArray(merged, axis=axis, dtype=dtype)

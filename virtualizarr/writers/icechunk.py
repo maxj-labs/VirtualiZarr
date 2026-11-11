@@ -621,6 +621,24 @@ PIECES_GROUP = "_pieces"
 """The child group that holds the pieces of a group's concatenated variables."""
 
 
+def _icechunk_takes_parts() -> bool:
+    """Whether virtual references can carry a prefix and several byte ranges."""
+    import icechunk
+
+    try:
+        icechunk.VirtualChunkSpec(
+            index=[0],
+            location="s3://b/k",
+            offset=0,
+            length=1,
+            prefix=b"",
+            more_ranges=None,
+        )
+    except TypeError:
+        return False
+    return True
+
+
 def _manifest_arrays(data: object) -> tuple[ManifestArray, ...]:
     """The ManifestArrays behind a variable's data: itself, its pieces, or none."""
     if isinstance(data, ManifestArray):
@@ -642,16 +660,17 @@ def write_concatenated_variable_to_icechunk(
     """
     Write a variable whose data is a ConcatenatedManifestArray into an icechunk store.
 
-    Every piece becomes a virtual array at ``_pieces/<name>/<i>`` under the group, and
-    the variable becomes an array with no chunks whose ``array_concat`` codec reads them.
+    The variable becomes one ordinary array, planned by
+    [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]: its ``switch``
+    codec decodes each run of chunks its own way, and where the pieces' chunk shapes
+    disagree each chunk is a virtual shard. Shards need an Icechunk whose virtual
+    references take a prefix and several ranges; without it, or when the pieces cannot
+    be planned, every piece becomes an array at ``_pieces/<name>/<i>`` and the variable
+    an array whose ``array_concat`` codec reads them.
     """
-    try:
-        from zarr.codecs import ArrayConcatCodec  # type: ignore[attr-defined]
-    except ImportError as err:
-        raise ImportError(
-            f"Variable {name!r} joins arrays that cannot share one chunk grid, which needs "
-            "the `array_concat` codec. The installed zarr-python does not have it."
-        ) from err
+    import zarr
+
+    from virtualizarr.manifests.plan import plan_joined_array
 
     if append_dim is not None or region is not None:
         raise NotImplementedError(
@@ -663,8 +682,66 @@ def write_concatenated_variable_to_icechunk(
             f"Variable {name!r} is a ConcatenatedManifestArray and the array {name!r} "
             "already exists. Write to a new group or store."
         )
-
     cma = cast(ConcatenatedManifestArray, var.data)
+    try:
+        from zarr.codecs import SwitchCodec  # type: ignore[attr-defined]
+
+        plan = plan_joined_array(cma.pieces, cma.axis, dtype=cma.dtype)
+        if plan.strategy == "shards" and not _icechunk_takes_parts():
+            raise NotImplementedError("this Icechunk cannot store a virtual shard")
+    except (ImportError, NotImplementedError) as err:
+        import warnings
+
+        warnings.warn(
+            f"Variable {name!r} is written as pieces joined by the `array_concat` codec: {err}.",
+            UserWarning,
+            stacklevel=2,
+        )
+        plan = None
+    if plan is not None:
+        import icechunk
+
+        if last_updated_at is None:
+            last_updated_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        with zarr.config.set({"array.rectilinear_chunks": True}):
+            arr = group.require_array(
+                name=name,
+                shape=plan.shape,
+                chunks=plan.chunk_grid,
+                dtype=plan.dtype,
+                filters=None,
+                compressors=None,
+                serializer=SwitchCodec(axis=plan.axis, cases=plan.cases),
+                dimension_names=var.dims,
+                fill_value=plan.fill_value,
+            )
+        key_prefix = name if group.name == "/" else f"{group.name}/{name}"
+        failed = store.set_virtual_refs(
+            key_prefix.lstrip("/"),
+            [
+                icechunk.VirtualChunkSpec(
+                    **ref, last_updated_at_checksum=last_updated_at
+                )
+                for ref in plan.refs
+            ],
+            validate_containers=True,
+        )
+        if failed:
+            raise ValueError(
+                f"{len(failed)} references of variable {name!r} are outside the "
+                "repository's virtual chunk containers."
+            )
+        update_attributes(arr, var.attrs, encoding=var.encoding)
+        return
+
+    try:
+        from zarr.codecs import ArrayConcatCodec  # type: ignore[attr-defined]
+    except ImportError as err:
+        raise ImportError(
+            f"Variable {name!r} joins arrays that cannot share one chunk grid, which needs "
+            "the `switch` or `array_concat` codec. The installed zarr-python has neither."
+        ) from err
+
     pieces_group = group.require_group(f"{PIECES_GROUP}/{name}")
     for i, piece in enumerate(cma.pieces):
         write_virtual_variable_to_icechunk(

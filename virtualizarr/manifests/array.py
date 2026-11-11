@@ -239,6 +239,13 @@ class ManifestArray:
     def astype(self, dtype: np.dtype, /, *, copy: bool = True) -> "ManifestArray":
         """Cannot change the dtype, but needed because xarray will call this even when it's a no-op."""
         if not np.issubdtype(self.dtype, dtype):
+            from virtualizarr.options import OPTIONS
+
+            if OPTIONS["mismatched_concat"] == "pieces":
+                # nothing is converted here: the array is marked to be read as `dtype`
+                from virtualizarr.manifests.concat import ConcatenatedManifestArray
+
+                return ConcatenatedManifestArray([self], axis=0, dtype=np.dtype(dtype))  # type: ignore[return-value]
             raise NotImplementedError()
         else:
             return self

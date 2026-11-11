@@ -25,9 +25,11 @@ class set_options:
 
         - ``"raise"`` (default): raise an error.
         - ``"pieces"``: keep each run of compatible arrays as a piece of a
-          [ConcatenatedManifestArray][virtualizarr.manifests.ConcatenatedManifestArray],
-          which is written to Icechunk as one array that reads its pieces through the
-          ``array_concat`` codec.
+          [ConcatenatedManifestArray][virtualizarr.manifests.ConcatenatedManifestArray].
+          It is written to Icechunk as one array: on a rectilinear chunk grid with a
+          ``switch`` codec where the pieces agree on their chunk shape off the joined
+          axis, and as virtual shards where they do not (see
+          [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]).
 
     Examples
     --------
