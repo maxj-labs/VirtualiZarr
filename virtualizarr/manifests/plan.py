@@ -80,7 +80,8 @@ def plan_joined_array(
     zdtype = get_data_type_from_native_dtype(dtype)
     fills = [dtype.type(p.metadata.fill_value) for p in pieces]
     keys = [f.tobytes() for f in fills]
-    array_fill = fills[keys.index(max(set(keys), key=keys.count))]
+    # the most common fill value; among equals, the first piece's
+    array_fill = fills[max(range(len(keys)), key=lambda i: (keys.count(keys[i]), -i))]
 
     notes: dict = {
         "distinct_chunk_shapes": sorted(set(chunks)),
@@ -105,11 +106,11 @@ def plan_joined_array(
             for c in p.metadata.to_dict()["codecs"]
         ]
         if p.dtype != dtype:
-            stored = p.metadata.data_type.to_json(zarr_format=3)
-            chain = [
-                {"name": "cast_value", "configuration": {"data_type": stored}},
-                *chain,
-            ]
+            configuration: dict = {"data_type": p.metadata.data_type.to_json(zarr_format=3)}
+            if p.dtype.kind in "iu" and dtype.kind == "f" and np.isnan(array_fill):
+                # the array's fill value must have a counterpart in the stored type
+                configuration["scalar_map"] = {"encode": [["NaN", int(p.metadata.fill_value)]]}
+            chain = [{"name": "cast_value", "configuration": configuration}, *chain]
         return json.loads(json.dumps(chain, default=str))
 
     def own_fill(p: "ManifestArray", fill: Any) -> dict:

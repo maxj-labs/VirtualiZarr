@@ -703,6 +703,7 @@ def write_concatenated_variable_to_icechunk(
 
         if last_updated_at is None:
             last_updated_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+        # the grid is rectilinear, which zarr-python still gates behind a setting
         with zarr.config.set({"array.rectilinear_chunks": True}):
             arr = group.require_array(
                 name=name,
@@ -715,23 +716,23 @@ def write_concatenated_variable_to_icechunk(
                 dimension_names=var.dims,
                 fill_value=plan.fill_value,
             )
-        key_prefix = name if group.name == "/" else f"{group.name}/{name}"
-        failed = store.set_virtual_refs(
-            key_prefix.lstrip("/"),
-            [
-                icechunk.VirtualChunkSpec(
-                    **ref, last_updated_at_checksum=last_updated_at
-                )
-                for ref in plan.refs
-            ],
-            validate_containers=True,
-        )
-        if failed:
-            raise ValueError(
-                f"{len(failed)} references of variable {name!r} are outside the "
-                "repository's virtual chunk containers."
+            key_prefix = name if group.name == "/" else f"{group.name}/{name}"
+            failed = store.set_virtual_refs(
+                key_prefix.lstrip("/"),
+                [
+                    icechunk.VirtualChunkSpec(
+                        **ref, last_updated_at_checksum=last_updated_at
+                    )
+                    for ref in plan.refs
+                ],
+                validate_containers=True,
             )
-        update_attributes(arr, var.attrs, encoding=var.encoding)
+            if failed:
+                raise ValueError(
+                    f"{len(failed)} references of variable {name!r} are outside the "
+                    "repository's virtual chunk containers."
+                )
+            update_attributes(arr, var.attrs, encoding=var.encoding)
         return
 
     try:
