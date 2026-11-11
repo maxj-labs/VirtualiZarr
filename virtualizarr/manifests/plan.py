@@ -54,6 +54,8 @@ def plan_joined_array(
     axis: int,
     dtype: np.dtype | None = None,
     shard_length_along_axis: int | None = None,
+    fill_value: Any = None,
+    like: dict | None = None,
 ) -> JoinedArrayPlan:
     """
     Plan one array from pieces joined along `axis`.
@@ -68,6 +70,13 @@ def plan_joined_array(
         pieces' chunks along it allow more than one choice. A shard may then hold
         source chunks of several files (daily maps grouped by the week, say), which
         needs an Icechunk whose references can name several objects.
+
+    fill_value
+        The joined array's fill value. By default the most common among the pieces.
+    like
+        To plan pieces that will be appended to an existing joined array: that array's
+        ``{"strategy": ..., "chunk_grid": [...]}``. The plan then uses the same
+        strategy and the same chunks (or shards) off the joined axis.
 
     Raises
     ------
@@ -93,6 +102,8 @@ def plan_joined_array(
     keys = [f.tobytes() for f in fills]
     # the most common fill value; among equals, the first piece's
     array_fill = fills[max(range(len(keys)), key=lambda i: (keys.count(keys[i]), -i))]
+    if fill_value is not None:
+        array_fill = dtype.type(fill_value)
 
     notes: dict = {
         "distinct_chunk_shapes": sorted(set(chunks)),
@@ -117,10 +128,14 @@ def plan_joined_array(
             for c in p.metadata.to_dict()["codecs"]
         ]
         if p.dtype != dtype:
-            configuration: dict = {"data_type": p.metadata.data_type.to_json(zarr_format=3)}
+            configuration: dict = {
+                "data_type": p.metadata.data_type.to_json(zarr_format=3)
+            }
             if p.dtype.kind in "iu" and dtype.kind == "f" and np.isnan(array_fill):
                 # the array's fill value must have a counterpart in the stored type
-                configuration["scalar_map"] = {"encode": [["NaN", int(p.metadata.fill_value)]]}
+                configuration["scalar_map"] = {
+                    "encode": [["NaN", int(p.metadata.fill_value)]]
+                }
             chain = [{"name": "cast_value", "configuration": configuration}, *chain]
         return json.loads(json.dumps(chain, default=str))
 
@@ -139,7 +154,20 @@ def plan_joined_array(
         return np.asarray(m._paths), np.asarray(m._offsets), np.asarray(m._lengths)
 
     grid: list[list[int]] = [[] for _ in range(ndim)]
-    if all(c[d] == chunks[0][d] for c in chunks for d in others):
+    same_off_axis = all(c[d] == chunks[0][d] for c in chunks for d in others)
+    if like is not None:
+        if like["strategy"] == "switch" and not (
+            same_off_axis
+            and all(
+                like["chunk_grid"][d] == _edges(shape[d], chunks[0][d]) for d in others
+            )
+        ):
+            raise NotImplementedError(
+                "the new pieces' chunks differ off the joined axis from the existing array's, "
+                "which stores plain chunks; the whole record has to be planned again"
+            )
+        same_off_axis = like["strategy"] == "switch"
+    if same_off_axis:
         for d in others:
             grid[d] = _edges(shape[d], chunks[0][d])
         out = JoinedArrayPlan(
@@ -190,12 +218,24 @@ def plan_joined_array(
     shard_axis = lcm_axis if lcm_axis <= min(p.shape[axis] for p in pieces) else None
     if shard_axis is not None and shard_length_along_axis:
         if shard_length_along_axis % lcm_axis:
-            raise ValueError(f"shard_length_along_axis must be a multiple of {lcm_axis}")
+            raise ValueError(
+                f"shard_length_along_axis must be a multiple of {lcm_axis}"
+            )
         shard_axis = shard_length_along_axis
     shard = [0] * ndim
     for d in others:
         lcm = math.lcm(*[c[d] for c in chunks])
         shard[d] = lcm if lcm <= shape[d] else shape[d]
+        if like is not None:
+            # keep the existing array's shards; they must hold whole source chunks
+            shard[d] = like["chunk_grid"][d][0]
+            if like["chunk_grid"][d] != _edges(shape[d], shard[d]) or (
+                shard[d] != shape[d] and any(shard[d] % c[d] for c in chunks)
+            ):
+                raise NotImplementedError(
+                    "the new pieces' chunks do not fit the existing array's shards; "
+                    "the whole record has to be planned again"
+                )
         grid[d] = _edges(shape[d], shard[d])
     notes["shard_shape"] = [
         ("one per piece" if shard_axis is None else shard_axis)

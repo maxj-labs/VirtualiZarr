@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import json
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Union, cast
@@ -522,6 +523,10 @@ def write_virtual_variable_to_icechunk(
 ) -> None:
     """Write a single virtual variable into an icechunk store"""
 
+    if append_dim and append_dim in var.dims and _is_joined_array(group.get(name)):
+        append_to_joined_array(store, group, name, var, append_dim, last_updated_at)
+        return
+
     ma = cast(ManifestArray, var.data)
     metadata = ma.metadata
 
@@ -642,6 +647,136 @@ def _reported_chunks(cma: ConcatenatedManifestArray) -> tuple[int, ...]:
     return tuple(out)
 
 
+def _is_joined_array(node: object) -> bool:
+    """Whether a node is an array written from a plan (its codec is `switch`)."""
+    if not isinstance(node, Array):
+        return False
+    codecs = node.metadata.to_dict().get("codecs") or ()
+    return (
+        len(codecs) == 1
+        and isinstance(codecs[0], dict)
+        and codecs[0].get("name") == "switch"
+    )
+
+
+def _grid_edges(chunk_grid: dict, shape: tuple[int, ...]) -> list[list[int]]:
+    """A chunk grid's edges along each dimension, from its JSON."""
+    configuration = chunk_grid["configuration"]
+    if chunk_grid["name"] == "regular":
+        return [
+            [c] * (n // c) + ([n % c] if n % c else [])
+            for n, c in zip(shape, configuration["chunk_shape"])
+        ]
+    out = []
+    for spec, n in zip(configuration["chunk_shapes"], shape):
+        if isinstance(spec, int):
+            out.append([spec] * (n // spec) + ([n % spec] if n % spec else []))
+        else:
+            edges: list[int] = []
+            for item in spec:
+                edges += [item] if isinstance(item, int) else [item[0]] * item[1]
+            out.append(edges)
+    return out
+
+
+def append_to_joined_array(
+    store: "IcechunkStore",
+    group: "Group",
+    name: str,
+    var: xr.Variable,
+    append_dim: str,
+    last_updated_at: Optional[datetime] = None,
+) -> None:
+    """
+    Append a virtual variable to an array that was written from a plan.
+
+    The new data is planned to fit the existing array (the same strategy, and the same
+    chunks or shards off the joined axis); its chunks are added after the existing ones
+    along the axis and its cases after the existing cases. Nothing already written
+    changes. New data that does not fit raises ``NotImplementedError``: the whole record
+    then has to be planned and written again.
+    """
+    import icechunk
+    import zarr
+    from zarr.core.buffer import default_buffer_prototype
+    from zarr.core.metadata.v3 import ArrayV3Metadata
+
+    from virtualizarr.manifests.plan import plan_joined_array
+
+    existing = cast(Array, group[name])
+    axis = get_axis(cast(list[str], list(var.dims)), append_dim)
+    meta = json.loads(json.dumps(existing.metadata.to_dict(), default=str))
+    codec = meta["codecs"][0]["configuration"]
+    if codec["axis"] != axis:
+        raise NotImplementedError(
+            f"The array {name!r} is joined along axis {codec['axis']}, not along {append_dim!r}."
+        )
+    grid = _grid_edges(meta["chunk_grid"], existing.shape)
+    strategy = (
+        "shards"
+        if any(
+            case["codecs"][0].get("name") == "sharding_indexed"
+            for case in codec["cases"]
+        )
+        else "switch"
+    )
+    data = var.data
+    pieces = (
+        list(data.pieces)
+        if isinstance(data, ConcatenatedManifestArray)
+        else [cast(ManifestArray, data)]
+    )
+    plan = plan_joined_array(
+        pieces,
+        axis,
+        dtype=existing.dtype,
+        fill_value=existing.fill_value,
+        like={"strategy": strategy, "chunk_grid": grid},
+    )
+    if plan.strategy == "shards" and not _icechunk_takes_parts():
+        raise NotImplementedError("this Icechunk cannot store a virtual shard")
+
+    existing_chunks = len(grid[axis])
+    cases = codec["cases"]
+    for case in plan.cases:
+        if {k: v for k, v in cases[-1].items() if k != "chunks"} == {
+            k: v for k, v in case.items() if k != "chunks"
+        }:
+            cases[-1]["chunks"] += case["chunks"]
+        else:
+            cases.append(case)
+    grid[axis] = grid[axis] + plan.chunk_grid[axis]
+    meta["shape"] = [
+        n + (plan.shape[axis] if d == axis else 0) for d, n in enumerate(existing.shape)
+    ]
+    meta["chunk_grid"] = {
+        "name": "rectilinear",
+        "configuration": {"kind": "inline", "chunk_shapes": grid},
+    }
+    key_prefix = (name if group.name == "/" else f"{group.name}/{name}").lstrip("/")
+    if last_updated_at is None:
+        last_updated_at = datetime.now(timezone.utc) + timedelta(seconds=1)
+    with zarr.config.set({"array.rectilinear_chunks": True}):
+        new_metadata = ArrayV3Metadata.from_dict(meta)
+        document = new_metadata.to_buffer_dict(default_buffer_prototype())["zarr.json"]
+        sync(store.set(f"{key_prefix}/zarr.json", document))
+        refs = []
+        for ref in plan.refs:
+            index = list(ref["index"])
+            index[axis] += existing_chunks
+            refs.append(
+                icechunk.VirtualChunkSpec(
+                    **{**ref, "index": index}, last_updated_at_checksum=last_updated_at
+                )
+            )
+        failed = store.set_virtual_refs(key_prefix, refs, validate_containers=True)
+    if failed:
+        raise ValueError(
+            f"{len(failed)} references of variable {name!r} are outside the "
+            "repository's virtual chunk containers."
+        )
+
+
 def _icechunk_takes_parts() -> bool:
     """Whether virtual references can carry a prefix and several byte ranges."""
     import icechunk
@@ -693,11 +828,20 @@ def write_concatenated_variable_to_icechunk(
 
     from virtualizarr.manifests.plan import plan_joined_array
 
-    if append_dim is not None or region is not None:
+    if region is not None:
         raise NotImplementedError(
-            f"Variable {name!r} is a ConcatenatedManifestArray, which cannot be appended "
-            "or written to a region."
+            f"Variable {name!r} is a ConcatenatedManifestArray, which cannot be written to a region."
         )
+    if append_dim is not None:
+        if append_dim not in var.dims:
+            return
+        if not _is_joined_array(group.get(name)):
+            raise NotImplementedError(
+                f"Variable {name!r} cannot be appended as pieces: the existing array {name!r} "
+                "is not a joined array (it has no `switch` codec)."
+            )
+        append_to_joined_array(store, group, name, var, append_dim, last_updated_at)
+        return
     if isinstance(group.get(name), Array):
         raise NotImplementedError(
             f"Variable {name!r} is a ConcatenatedManifestArray and the array {name!r} "

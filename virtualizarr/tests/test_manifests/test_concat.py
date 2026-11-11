@@ -164,7 +164,17 @@ def test_icechunk_roundtrip(years, tmp_path: Path):
     )
 
     # readers are offered chunks they can use, never one chunk spanning everything
-    assert int(np.prod(array.chunks if hasattr(array, "_chunk_grid") and array.metadata.chunk_grid.__class__.__name__.startswith("Regular") else (1,))) < array.size
+    assert (
+        int(
+            np.prod(
+                array.chunks
+                if hasattr(array, "_chunk_grid")
+                and array.metadata.chunk_grid.__class__.__name__.startswith("Regular")
+                else (1,)
+            )
+        )
+        < array.size
+    )
     with xr.open_zarr(store, consolidated=False, chunks=None) as actual:
         assert list(actual.data_vars) == ["tmin"]
         assert actual["tmin"].attrs == expected["tmin"].attrs
@@ -326,19 +336,117 @@ def test_file_without_the_variable_reads_as_its_fill_value(tmp_path: Path):
     data = [rng.normal(size=(4, 6, 5)).astype("float32") for _ in range(2)]
     vdss = []
     for i, d in enumerate(data):
-        _write(tmp_path / f"g{i}.nc", d, t0=8 * i, chunksizes=(2, 6, 5), zlib=True, _FillValue=np.float32(-9999.0))
-        vdss.append(open_virtual_dataset(url=str(tmp_path / f"g{i}.nc"), registry=registry, parser=HDFParser(), loadable_variables=["time"]))
+        _write(
+            tmp_path / f"g{i}.nc",
+            d,
+            t0=8 * i,
+            chunksizes=(2, 6, 5),
+            zlib=True,
+            _FillValue=np.float32(-9999.0),
+        )
+        vdss.append(
+            open_virtual_dataset(
+                url=str(tmp_path / f"g{i}.nc"),
+                registry=registry,
+                parser=HDFParser(),
+                loadable_variables=["time"],
+            )
+        )
     first, last = (v["v"].data for v in vdss)
-    absent = first.with_fill_value_only(np.float32(7.0))  # the middle granule has no `v`
+    absent = first.with_fill_value_only(
+        np.float32(7.0)
+    )  # the middle granule has no `v`
     plan = plan_joined_array([first, absent, last], axis=0)
     assert plan.strategy == "switch"
     assert plan.notes["pieces_with_their_own_fill"] == 1
     assert [case.get("fill_value") for case in plan.cases] == [None, 7.0, None]
 
-    middle = xr.Dataset({"v": (("time", "y", "x"), absent)}, coords={"time": ("time", np.arange(4.0) + 4)})
+    middle = xr.Dataset(
+        {"v": (("time", "y", "x"), absent)},
+        coords={"time": ("time", np.arange(4.0) + 4)},
+    )
     with virtualizarr.set_options(mismatched_concat="pieces"):
-        vds = xr.concat([vdss[0], middle, vdss[1]], dim="time", coords="minimal", compat="override")
+        vds = xr.concat(
+            [vdss[0], middle, vdss[1]], dim="time", coords="minimal", compat="override"
+        )
     array = zarr.open_array(_roundtrip(vds), path="v", mode="r")
-    expected = np.concatenate([data[0], np.full((4, 6, 5), 7.0, dtype="float32"), data[1]])
+    expected = np.concatenate(
+        [data[0], np.full((4, 6, 5), 7.0, dtype="float32"), data[1]]
+    )
     np.testing.assert_array_equal(array[:], expected)
     np.testing.assert_array_equal(array[2:10, 1:4, ::2], expected[2:10, 1:4, ::2])
+
+
+@requires_hdf5plugin
+@requires_icechunk
+@pytest.mark.parametrize("layouts", ["same chunk shape", "chunk shape changes"])
+def test_append_to_a_joined_array(tmp_path: Path, layouts: str):
+    """New files, in yet another layout, are appended without touching what is there."""
+    import icechunk
+
+    from virtualizarr.parsers import HDFParser
+    from virtualizarr.writers.icechunk import _icechunk_takes_parts
+
+    if layouts == "chunk shape changes" and not _icechunk_takes_parts():
+        pytest.skip("needs an Icechunk that stores virtual shards")
+    rng = np.random.default_rng(5)
+    second = (4, 6, 5) if layouts == "same chunk shape" else (2, 12, 5)
+    encodings = [
+        dict(chunksizes=(4, 6, 5), zlib=True, shuffle=False),
+        dict(chunksizes=second, zlib=True, shuffle=True),
+        dict(chunksizes=(4, 6, 5), zlib=False),  # appended: a third layout, 10 steps
+        dict(chunksizes=(4, 6, 5), zlib=True, shuffle=False),  # appended again
+    ]
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    vdss, datasets, t0 = [], [], 0
+    for i, (n, encoding) in enumerate(zip((8, 8, 10, 7), encodings)):
+        path = tmp_path / f"f{i}.nc"
+        datasets.append(
+            _write(
+                path, rng.normal(size=(n, 12, 10)).astype("float32"), t0=t0, **encoding
+            )
+        )
+        vdss.append(
+            open_virtual_dataset(
+                url=str(path),
+                registry=registry,
+                parser=HDFParser(),
+                loadable_variables=["time"],
+            )
+        )
+        t0 += n
+
+    config = icechunk.RepositoryConfig.default()
+    config.set_virtual_chunk_container(
+        icechunk.VirtualChunkContainer(
+            url_prefix=PYTEST_TMP_DIRECTORY_URL_PREFIX,
+            store=icechunk.local_filesystem_store(PYTEST_TMP_DIRECTORY_URL_PREFIX),
+        )
+    )
+    repo = icechunk.Repository.create(
+        storage=icechunk.Storage.new_in_memory(),
+        config=config,
+        authorize_virtual_chunk_access={PYTEST_TMP_DIRECTORY_URL_PREFIX: None},
+    )
+    zarr.config.set({"array.rectilinear_chunks": True})
+    with virtualizarr.set_options(mismatched_concat="pieces"):
+        first = xr.concat(vdss[:2], dim="time", coords="minimal", compat="override")
+    session = repo.writable_session("main")
+    first.vz.to_icechunk(session.store)
+    session.commit("two files")
+    for i in (2, 3):
+        session = repo.writable_session("main")
+        vdss[i].vz.to_icechunk(session.store, append_dim="time")
+        session.commit(f"append file {i}")
+        expected = np.concatenate([d["v"].values for d in datasets[: i + 1]])
+        with xr.open_zarr(
+            repo.readonly_session("main").store, consolidated=False, chunks=None
+        ) as ds:
+            assert ds.sizes["time"] == expected.shape[0]
+            np.testing.assert_array_equal(ds["v"].values, expected)
+            np.testing.assert_array_equal(
+                ds["time"].values, np.arange(expected.shape[0], dtype="float64")
+            )
+    array = zarr.open_array(repo.readonly_session("main").store, path="v", mode="r")
+    cases = array.metadata.to_dict()["codecs"][0]["configuration"]["cases"]
+    assert len(cases) == 4
