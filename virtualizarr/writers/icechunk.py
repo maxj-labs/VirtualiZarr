@@ -621,6 +621,27 @@ PIECES_GROUP = "_pieces"
 """The child group that holds the pieces of a group's concatenated variables."""
 
 
+def _reported_chunks(cma: ConcatenatedManifestArray) -> tuple[int, ...]:
+    """
+    The chunk shape an array joined by the `array_concat` codec reports to readers.
+
+    The array stores no chunks, so this is a hint. A common multiple of the pieces'
+    chunk sizes lets a reader that works chunk by chunk read each stored chunk once;
+    where that exceeds the array, the largest of the pieces' chunk sizes is used.
+    """
+    import math
+
+    from virtualizarr.manifests.utils import manifest_chunk_shape
+
+    shapes = [manifest_chunk_shape(piece.metadata) for piece in cma.pieces]
+    out = []
+    for d, extent in enumerate(cma.shape):
+        sizes = [shape[d] for shape in shapes]
+        lcm = math.lcm(*sizes)
+        out.append(min(extent, lcm if lcm <= extent else max(sizes)))
+    return tuple(out)
+
+
 def _icechunk_takes_parts() -> bool:
     """Whether virtual references can carry a prefix and several byte ranges."""
     import icechunk
@@ -757,7 +778,7 @@ def write_concatenated_variable_to_icechunk(
     arr = group.require_array(
         name=name,
         shape=cma.shape,
-        chunks=cma.shape,
+        chunks=_reported_chunks(cma),
         dtype=first.data_type.to_native_dtype(),
         filters=None,
         compressors=None,

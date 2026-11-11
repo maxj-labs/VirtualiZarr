@@ -163,6 +163,8 @@ def test_icechunk_roundtrip(years, tmp_path: Path):
         ["array_concat"],
     )
 
+    # readers are offered chunks they can use, never one chunk spanning everything
+    assert int(np.prod(array.chunks if hasattr(array, "_chunk_grid") and array.metadata.chunk_grid.__class__.__name__.startswith("Regular") else (1,))) < array.size
     with xr.open_zarr(store, consolidated=False, chunks=None) as actual:
         assert list(actual.data_vars) == ["tmin"]
         assert actual["tmin"].attrs == expected["tmin"].attrs
