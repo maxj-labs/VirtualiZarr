@@ -311,3 +311,34 @@ def test_stacking_files_without_the_joined_axis(tmp_path: Path):
     assert vds["v"].shape == (4, 12, 10)
     array = zarr.open_array(_roundtrip(vds), path="v", mode="r")
     np.testing.assert_array_equal(array[:], np.stack(maps))
+
+
+@requires_hdf5plugin
+@requires_icechunk
+def test_file_without_the_variable_reads_as_its_fill_value(tmp_path: Path):
+    """A granule that lacks the variable is a piece that stores nothing. It reads as
+    its own fill value, even where that is not the joined array's."""
+    from virtualizarr.manifests.plan import plan_joined_array
+    from virtualizarr.parsers import HDFParser
+
+    rng = np.random.default_rng(4)
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    data = [rng.normal(size=(4, 6, 5)).astype("float32") for _ in range(2)]
+    vdss = []
+    for i, d in enumerate(data):
+        _write(tmp_path / f"g{i}.nc", d, t0=8 * i, chunksizes=(2, 6, 5), zlib=True, _FillValue=np.float32(-9999.0))
+        vdss.append(open_virtual_dataset(url=str(tmp_path / f"g{i}.nc"), registry=registry, parser=HDFParser(), loadable_variables=["time"]))
+    first, last = (v["v"].data for v in vdss)
+    absent = first.with_fill_value_only(np.float32(7.0))  # the middle granule has no `v`
+    plan = plan_joined_array([first, absent, last], axis=0)
+    assert plan.strategy == "switch"
+    assert plan.notes["pieces_with_their_own_fill"] == 1
+    assert [case.get("fill_value") for case in plan.cases] == [None, 7.0, None]
+
+    middle = xr.Dataset({"v": (("time", "y", "x"), absent)}, coords={"time": ("time", np.arange(4.0) + 4)})
+    with virtualizarr.set_options(mismatched_concat="pieces"):
+        vds = xr.concat([vdss[0], middle, vdss[1]], dim="time", coords="minimal", compat="override")
+    array = zarr.open_array(_roundtrip(vds), path="v", mode="r")
+    expected = np.concatenate([data[0], np.full((4, 6, 5), 7.0, dtype="float32"), data[1]])
+    np.testing.assert_array_equal(array[:], expected)
+    np.testing.assert_array_equal(array[2:10, 1:4, ::2], expected[2:10, 1:4, ::2])

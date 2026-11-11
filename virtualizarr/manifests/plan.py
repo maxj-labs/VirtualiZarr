@@ -50,13 +50,24 @@ class JoinedArrayPlan:
 
 
 def plan_joined_array(
-    pieces: Sequence["ManifestArray"], axis: int, dtype: np.dtype | None = None
+    pieces: Sequence["ManifestArray"],
+    axis: int,
+    dtype: np.dtype | None = None,
+    shard_length_along_axis: int | None = None,
 ) -> JoinedArrayPlan:
     """
     Plan one array from pieces joined along `axis`.
 
     The pieces may differ in codecs, chunk shape, fill value and data type, and a piece
     may end in a chunk that is cut short. They must agree on their extent off the axis.
+
+    Parameters
+    ----------
+    shard_length_along_axis
+        For virtual shards, how far a shard reaches along the joined axis, when the
+        pieces' chunks along it allow more than one choice. A shard may then hold
+        source chunks of several files (daily maps grouped by the week, say), which
+        needs an Icechunk whose references can name several objects.
 
     Raises
     ------
@@ -177,6 +188,10 @@ def plan_joined_array(
             )
     lcm_axis = math.lcm(*[c[axis] for c in chunks])
     shard_axis = lcm_axis if lcm_axis <= min(p.shape[axis] for p in pieces) else None
+    if shard_axis is not None and shard_length_along_axis:
+        if shard_length_along_axis % lcm_axis:
+            raise ValueError(f"shard_length_along_axis must be a multiple of {lcm_axis}")
+        shard_axis = shard_length_along_axis
     shard = [0] * ndim
     for d in others:
         lcm = math.lcm(*[c[d] for c in chunks])
