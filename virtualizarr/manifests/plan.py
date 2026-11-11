@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ if TYPE_CHECKING:
     from virtualizarr.manifests.array import ManifestArray
 
 MISSING = 2**64 - 1
+KEY_BYTES = 8
 
 
 def _edges(n: int, c: int) -> list[int]:
@@ -47,6 +49,8 @@ class JoinedArrayPlan:
     refs: list[dict] = field(default_factory=list)
     source_chunks: int = 0
     notes: dict = field(default_factory=dict)
+    select: str = "position"
+    key_bytes: int = KEY_BYTES
 
 
 def plan_joined_array(
@@ -56,6 +60,7 @@ def plan_joined_array(
     shard_length_along_axis: int | None = None,
     fill_value: Any = None,
     like: dict | None = None,
+    select: str = "position",
 ) -> JoinedArrayPlan:
     """
     Plan one array from pieces joined along `axis`.
@@ -65,6 +70,13 @@ def plan_joined_array(
 
     Parameters
     ----------
+    select
+        How the `switch` codec finds a chunk's case. ``"position"``: from the chunk's
+        place along the joined axis; nothing is stored per chunk, and released Icechunk
+        can hold the array unless it needs shards. ``"key"``: from a key in front of
+        the chunk's bytes, which every reference carries as a prefix; chunks describe
+        themselves and the case table has one entry per distinct layout, but the store
+        must take references with a prefix.
     shard_length_along_axis
         For virtual shards, how far a shard reaches along the joined axis, when the
         pieces' chunks along it allow more than one choice. A shard may then hold
@@ -115,11 +127,21 @@ def plan_joined_array(
     }
     cases: list[dict] = []
 
-    def add_case(n: int, case: dict) -> None:
+    def add_case(n: int, case: dict) -> bytes:
+        """Record a case for `n` more chunks. Returns the key its chunks begin with,
+        which is empty when cases are found by position."""
+        if select == "key":
+            # the key names the case by its content, so equal cases share one entry
+            canonical = json.dumps(case, sort_keys=True, separators=(",", ":"))
+            key = hashlib.sha256(canonical.encode()).digest()[:KEY_BYTES]
+            if not any(c["key"] == key.hex() for c in cases):
+                cases.append({"key": key.hex(), **case})
+            return key
         if cases and {k: v for k, v in cases[-1].items() if k != "chunks"} == case:
             cases[-1]["chunks"] += n
         else:
             cases.append({"chunks": n, **case})
+        return b""
 
     def codecs_of(p: "ManifestArray") -> list[dict]:
         """The piece's chain, converting its stored data type to the array's first."""
@@ -146,6 +168,12 @@ def plan_joined_array(
             (p.manifest._paths != "").all()
         ):
             return {}
+        if select == "key":
+            # a chunk that stores nothing has no reference to carry a key
+            raise NotImplementedError(
+                "a piece leaves chunks unstored and its fill value is not the array's; "
+                "that needs select='position'"
+            )
         notes["pieces_with_their_own_fill"] += 1
         return {"fill_value": zdtype.to_json_scalar(fill, zarr_format=3)}
 
@@ -171,15 +199,25 @@ def plan_joined_array(
         for d in others:
             grid[d] = _edges(shape[d], chunks[0][d])
         out = JoinedArrayPlan(
-            "switch", axis, tuple(shape), dtype, array_fill, grid, cases, notes=notes
+            "switch",
+            axis,
+            tuple(shape),
+            dtype,
+            array_fill,
+            grid,
+            cases,
+            notes=notes,
+            select=select,
         )
         base = 0
         for p, c, fill in zip(pieces, chunks, fills):
             along = _edges(p.shape[axis], c[axis])
             encoded: list[int | None] = list(c)
-            if p.shape[axis] % c[axis] == 0:
-                encoded[axis] = None  # every chunk is whole: as large as its place
-            add_case(
+            if p.shape[axis] % c[axis] == 0 and select == "position":
+                # every chunk is whole: as large as its place. (By key the shape is
+                # spelled out, so pieces with and without a cut chunk share a case.)
+                encoded[axis] = None
+            key = add_case(
                 len(along),
                 {
                     "codecs": codecs_of(p),
@@ -192,14 +230,15 @@ def plan_joined_array(
             for idx in zip(*np.nonzero(paths != "")):
                 index = [int(i) for i in idx]
                 index[axis] += base
-                out.refs.append(
-                    {
-                        "index": index,
-                        "location": str(paths[idx]),
-                        "offset": int(offsets[idx]),
-                        "length": int(lengths[idx]),
-                    }
-                )
+                ref: dict = {
+                    "index": index,
+                    "location": str(paths[idx]),
+                    "offset": int(offsets[idx]),
+                    "length": int(lengths[idx]),
+                }
+                if key:
+                    ref["prefix"] = key
+                out.refs.append(ref)
             out.source_chunks += int((paths != "").sum())
             base += len(along)
         return out
@@ -244,7 +283,15 @@ def plan_joined_array(
         for d in range(ndim)
     ]
     out = JoinedArrayPlan(
-        "shards", axis, tuple(shape), dtype, array_fill, grid, cases, notes=notes
+        "shards",
+        axis,
+        tuple(shape),
+        dtype,
+        array_fill,
+        grid,
+        cases,
+        notes=notes,
+        select=select,
     )
     base = 0
     for p, c, fill in zip(pieces, chunks, fills):
@@ -267,7 +314,7 @@ def plan_joined_array(
             },
         }
         # Neighbours in a virtual shard are separate source chunks, so ranges are never merged.
-        add_case(
+        key = add_case(
             len(along),
             {
                 "codecs": [sharding],
@@ -299,7 +346,9 @@ def plan_joined_array(
                         "location": first,
                         "offset": parts[0][1],
                         "length": parts[0][2],
-                        "prefix": index.tobytes(),
+                        # the key, when there is one, then the shard index, whose
+                        # offsets count from after the key
+                        "prefix": key + index.tobytes(),
                         # a part in another object than the first names it; the rest say None
                         "more_ranges": [
                             (None if loc == first else loc, o, n)

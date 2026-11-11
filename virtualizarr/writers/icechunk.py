@@ -707,7 +707,8 @@ def append_to_joined_array(
     axis = get_axis(cast(list[str], list(var.dims)), append_dim)
     meta = json.loads(json.dumps(existing.metadata.to_dict(), default=str))
     codec = meta["codecs"][0]["configuration"]
-    if codec["axis"] != axis:
+    select = codec.get("select", "position")
+    if select == "position" and codec["axis"] != axis:
         raise NotImplementedError(
             f"The array {name!r} is joined along axis {codec['axis']}, not along {append_dim!r}."
         )
@@ -732,14 +733,21 @@ def append_to_joined_array(
         dtype=existing.dtype,
         fill_value=existing.fill_value,
         like={"strategy": strategy, "chunk_grid": grid},
+        select=select,
     )
-    if plan.strategy == "shards" and not _icechunk_takes_parts():
-        raise NotImplementedError("this Icechunk cannot store a virtual shard")
+    if (plan.strategy == "shards" or select == "key") and not _icechunk_takes_parts():
+        raise NotImplementedError(
+            "this Icechunk cannot store a reference with a prefix or several ranges"
+        )
 
     existing_chunks = len(grid[axis])
     cases = codec["cases"]
     for case in plan.cases:
-        if {k: v for k, v in cases[-1].items() if k != "chunks"} == {
+        if select == "key":
+            # cases are named by their content: the two tables merge by union
+            if not any(c["key"] == case["key"] for c in cases):
+                cases.append(case)
+        elif {k: v for k, v in cases[-1].items() if k != "chunks"} == {
             k: v for k, v in case.items() if k != "chunks"
         }:
             cases[-1]["chunks"] += case["chunks"]
@@ -851,9 +859,17 @@ def write_concatenated_variable_to_icechunk(
     try:
         from zarr.codecs import SwitchCodec  # type: ignore[attr-defined]
 
-        plan = plan_joined_array(cma.pieces, cma.axis, dtype=cma.dtype)
-        if plan.strategy == "shards" and not _icechunk_takes_parts():
-            raise NotImplementedError("this Icechunk cannot store a virtual shard")
+        from virtualizarr.options import OPTIONS
+
+        plan = plan_joined_array(
+            cma.pieces, cma.axis, dtype=cma.dtype, select=OPTIONS["switch_select"]
+        )
+        if (
+            plan.strategy == "shards" or plan.select == "key"
+        ) and not _icechunk_takes_parts():
+            raise NotImplementedError(
+                "this Icechunk cannot store a reference with a prefix or several ranges"
+            )
     except (ImportError, NotImplementedError) as err:
         import warnings
 
@@ -877,7 +893,12 @@ def write_concatenated_variable_to_icechunk(
                 dtype=plan.dtype,
                 filters=None,
                 compressors=None,
-                serializer=SwitchCodec(axis=plan.axis, cases=plan.cases),
+                serializer=SwitchCodec(
+                    axis=plan.axis,
+                    cases=plan.cases,
+                    select=plan.select,
+                    key_bytes=plan.key_bytes,
+                ),
                 dimension_names=var.dims,
                 fill_value=plan.fill_value,
             )

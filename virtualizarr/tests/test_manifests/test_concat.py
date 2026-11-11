@@ -380,15 +380,18 @@ def test_file_without_the_variable_reads_as_its_fill_value(tmp_path: Path):
 @requires_hdf5plugin
 @requires_icechunk
 @pytest.mark.parametrize("layouts", ["same chunk shape", "chunk shape changes"])
-def test_append_to_a_joined_array(tmp_path: Path, layouts: str):
+@pytest.mark.parametrize("select", ["position", "key"])
+def test_append_to_a_joined_array(tmp_path: Path, layouts: str, select: str):
     """New files, in yet another layout, are appended without touching what is there."""
     import icechunk
 
     from virtualizarr.parsers import HDFParser
     from virtualizarr.writers.icechunk import _icechunk_takes_parts
 
-    if layouts == "chunk shape changes" and not _icechunk_takes_parts():
-        pytest.skip("needs an Icechunk that stores virtual shards")
+    if (
+        layouts == "chunk shape changes" or select == "key"
+    ) and not _icechunk_takes_parts():
+        pytest.skip("needs an Icechunk whose references take a prefix and more ranges")
     rng = np.random.default_rng(5)
     second = (4, 6, 5) if layouts == "same chunk shape" else (2, 12, 5)
     encodings = [
@@ -432,7 +435,8 @@ def test_append_to_a_joined_array(tmp_path: Path, layouts: str):
     with virtualizarr.set_options(mismatched_concat="pieces"):
         first = xr.concat(vdss[:2], dim="time", coords="minimal", compat="override")
     session = repo.writable_session("main")
-    first.vz.to_icechunk(session.store)
+    with virtualizarr.set_options(switch_select=select):
+        first.vz.to_icechunk(session.store)
     session.commit("two files")
     for i in (2, 3):
         session = repo.writable_session("main")
@@ -448,5 +452,8 @@ def test_append_to_a_joined_array(tmp_path: Path, layouts: str):
                 ds["time"].values, np.arange(expected.shape[0], dtype="float64")
             )
     array = zarr.open_array(repo.readonly_session("main").store, path="v", mode="r")
-    cases = array.metadata.to_dict()["codecs"][0]["configuration"]["cases"]
-    assert len(cases) == 4
+    configuration = array.metadata.to_dict()["codecs"][0]["configuration"]
+    assert configuration.get("select", "position") == select
+    # by position: one case per run of chunks. By key: one per distinct layout, and
+    # the first and last files share theirs.
+    assert len(configuration["cases"]) == (4 if select == "position" else 3)

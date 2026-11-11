@@ -5,11 +5,15 @@ from typing import Any, Literal, TypedDict
 
 class _Options(TypedDict):
     mismatched_concat: Literal["raise", "pieces"]
+    switch_select: Literal["position", "key"]
 
 
-OPTIONS: _Options = {"mismatched_concat": "raise"}
+OPTIONS: _Options = {"mismatched_concat": "raise", "switch_select": "position"}
 
-_VALID: dict[str, tuple[Any, ...]] = {"mismatched_concat": ("raise", "pieces")}
+_VALID: dict[str, tuple[Any, ...]] = {
+    "mismatched_concat": ("raise", "pieces"),
+    "switch_select": ("position", "key"),
+}
 
 
 class set_options:
@@ -30,6 +34,13 @@ class set_options:
           ``switch`` codec where the pieces agree on their chunk shape off the joined
           axis, and as virtual shards where they do not (see
           [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]).
+
+    switch_select
+        How a joined array's ``switch`` codec finds each chunk's case:
+        ``"position"`` (default) from the chunk's place along the joined axis, or
+        ``"key"`` from a key that every chunk reference carries as a prefix, so that a
+        chunk describes itself (see
+        [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]).
 
     Examples
     --------
