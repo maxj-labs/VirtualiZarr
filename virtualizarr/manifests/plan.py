@@ -130,6 +130,7 @@ def plan_joined_array(
         "pieces_with_their_own_fill": 0,
     }
     cases: list[dict] = []
+    seen_keys: set[bytes] = set()
 
     def add_case(n: int, case: dict) -> bytes:
         """Record a case for `n` more chunks. Returns the key its chunks begin with,
@@ -138,7 +139,8 @@ def plan_joined_array(
             # the key names the case by its content, so equal cases share one entry
             canonical = json.dumps(case, sort_keys=True, separators=(",", ":"))
             key = hashlib.sha256(canonical.encode()).digest()[:KEY_BYTES]
-            if not any(c["key"] == key.hex() for c in cases):
+            if key not in seen_keys:
+                seen_keys.add(key)
                 cases.append({"key": key.hex(), **case})
             return key
         if cases and {k: v for k, v in cases[-1].items() if k != "chunks"} == case:
