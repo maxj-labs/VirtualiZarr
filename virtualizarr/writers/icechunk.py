@@ -702,6 +702,7 @@ def append_to_joined_array(
     from zarr.core.metadata.v3 import ArrayV3Metadata
 
     from virtualizarr.manifests.plan import plan_joined_array
+    from virtualizarr.options import OPTIONS
 
     existing = cast(Array, group[name])
     axis = get_axis(cast(list[str], list(var.dims)), append_dim)
@@ -711,12 +712,6 @@ def append_to_joined_array(
     codec = meta["codecs"][0]["configuration"]
     select = codec.get("select", "position")
     key_bytes = codec.get("key_bytes", 8)
-    if select == "key" and key_bytes < 8:
-        raise NotImplementedError(
-            f"The array {name!r} numbers its cases with {key_bytes}-byte keys, and new "
-            "files would be numbered again from zero. Appending needs hashed keys "
-            "(8 bytes or more)."
-        )
     # every run with its own case, however the codec wrote them down
     codec["cases"] = json.loads(
         json.dumps(SwitchCodec.from_dict(meta["codecs"][0]).cases)
@@ -748,6 +743,7 @@ def append_to_joined_array(
         like={"strategy": strategy, "chunk_grid": grid},
         select=select,
         key_bytes=key_bytes,
+        parameters=OPTIONS["switch_parameters"],
     )
     if (plan.strategy == "shards" or select == "key") and not _icechunk_takes_parts():
         raise NotImplementedError(
@@ -905,6 +901,7 @@ def write_concatenated_variable_to_icechunk(
             dtype=cma.dtype,
             select=OPTIONS["switch_select"],
             key_bytes=OPTIONS["switch_key_bytes"],
+            parameters=OPTIONS["switch_parameters"],
         )
         if (
             plan.strategy == "shards" or plan.select == "key"

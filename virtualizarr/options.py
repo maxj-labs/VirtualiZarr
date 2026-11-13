@@ -7,18 +7,21 @@ class _Options(TypedDict):
     mismatched_concat: Literal["raise", "pieces"]
     switch_select: Literal["position", "key"]
     switch_key_bytes: int
+    switch_parameters: bool
 
 
 OPTIONS: _Options = {
     "mismatched_concat": "raise",
     "switch_select": "position",
     "switch_key_bytes": 8,
+    "switch_parameters": True,
 }
 
 _VALID: dict[str, tuple[Any, ...]] = {
     "mismatched_concat": ("raise", "pieces"),
     "switch_select": ("position", "key"),
-    "switch_key_bytes": (1, 2, 4, 8, 16),
+    "switch_key_bytes": (1, 2, 4, 8, 16, 32),
+    "switch_parameters": (True, False),
 }
 
 
@@ -49,8 +52,15 @@ class set_options:
         [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]).
 
     switch_key_bytes
-        The length of the key when ``switch_select="key"``: 8 (default) or 16 for a key
-        that is a hash of its case, or 1, 2 or 4 for a key that numbers the cases.
+        The length of the key when ``switch_select="key"``, 8 by default. A key is the
+        leading bytes of the hash of its case, whatever its length; a shorter key saves
+        space in every reference and makes it likelier that two cases share a key, which
+        is refused when the array is planned.
+
+    switch_parameters
+        With ``switch_select="key"``, whether files that differ only in the numbers of a
+        ``scale_offset`` codec share one case, each chunk reference carrying its own
+        numbers after the key (default True).
 
     Examples
     --------

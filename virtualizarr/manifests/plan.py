@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 from dataclasses import dataclass, field
@@ -66,6 +65,7 @@ def plan_joined_array(
     like: dict | None = None,
     select: str = "position",
     key_bytes: int = KEY_BYTES,
+    parameters: bool = True,
 ) -> JoinedArrayPlan:
     """
     Plan one array from pieces joined along `axis`.
@@ -83,11 +83,16 @@ def plan_joined_array(
         themselves and the case table has one entry per distinct layout, but the store
         must take references with a prefix.
     key_bytes
-        With ``select="key"``, the length of the key. From 8 bytes up a key is a hash of
-        its case, so equal cases have equal keys in any array and tables merge by
-        union. A shorter key numbers the cases in order (1 byte: up to 256 cases,
-        2 bytes: 65,536), which saves a few bytes per reference and means two arrays
-        planned apart cannot be joined without renumbering one.
+        With ``select="key"``, the length of the key. A key is the first `key_bytes`
+        bytes of the hash of its case (`zarr.codecs.switch.case_key`), so equal cases
+        have equal keys in any array and tables merge by union. A shorter key saves a
+        few bytes per reference and makes it likelier that two cases share a key, which
+        is refused here with a request for a longer one.
+    parameters
+        With ``select="key"``, whether pieces that differ only in the numbers of a
+        `scale_offset` codec share one case. The case leaves the offset and scale open,
+        and every reference carries its own after the key, as two float64. (Not used
+        for virtual shards, whose chunks are read by byte range.)
     shard_length_along_axis
         For virtual shards, how far a shard reaches along the joined axis, when the
         pieces' chunks along it allow more than one choice. A shard may then hold
@@ -137,30 +142,37 @@ def plan_joined_array(
         "pieces_with_their_own_fill": 0,
     }
     cases: list[dict] = []
-    seen_keys: set[bytes] = set()
-    numbered: dict[str, bytes] = {}
+    seen_keys: dict[bytes, str] = {}
 
-    def add_case(n: int, case: dict) -> bytes:
-        """Record a case for `n` more chunks. Returns the key its chunks begin with,
-        which is empty when cases are found by position."""
+    def add_case(n: int, case: dict, template: bool = False) -> bytes:
+        """Record a case for `n` more chunks. Returns what its chunks begin with: the
+        case's key and then any values the case leaves open. Empty when cases are found
+        by position."""
         if select == "key":
+            from zarr.codecs.switch import case_key
+
+            values: list[float] = []
+            if template and parameters:
+                case = json.loads(json.dumps(case))
+                for codec in case["codecs"]:
+                    if isinstance(codec, dict) and codec.get("name") == "scale_offset":
+                        configuration = codec.setdefault("configuration", {})
+                        for name, default in (("offset", 0.0), ("scale", 1.0)):
+                            values.append(float(configuration.get(name, default)))
+                            configuration[name] = {"parameter": len(values) - 1}
+                if values:
+                    case["parameters"] = ["float64"] * len(values)
             # the key names the case by its content, so equal cases share one entry
-            canonical = json.dumps(case, sort_keys=True, separators=(",", ":"))
-            if key_bytes >= 8:
-                key = hashlib.sha256(canonical.encode()).digest()[:key_bytes]
-            elif canonical in numbered:
-                return numbered[canonical]
-            else:
-                if len(numbered) >= 256**key_bytes:
-                    raise NotImplementedError(
-                        f"more than {256**key_bytes} cases do not fit a key of {key_bytes} bytes"
-                    )
-                key = len(numbered).to_bytes(key_bytes, "big")
-                numbered[canonical] = key
+            key = case_key(case, key_bytes)
+            canonical = json.dumps(case, sort_keys=True)
             if key not in seen_keys:
-                seen_keys.add(key)
+                seen_keys[key] = canonical
                 cases.append({"key": key.hex(), **case})
-            return key
+            elif seen_keys[key] != canonical:
+                raise NotImplementedError(
+                    f"two cases share the {key_bytes}-byte key {key.hex()}; use a longer key"
+                )
+            return key + np.asarray(values, dtype="<f8").tobytes()
         if cases and {k: v for k, v in cases[-1].items() if k != "chunks"} == case:
             cases[-1]["chunks"] += n
         else:
@@ -240,6 +252,7 @@ def plan_joined_array(
             key = add_case(
                 len(along),
                 {"codecs": codecs_of(p), "encoded_chunk_shape": encoded, **own},
+                template=True,
             )
             grid[axis] += along
             paths, offsets, lengths = paths_of(p)

@@ -551,8 +551,11 @@ def test_unwritten_chunks_read_as_their_own_files_fill_value(
 
 
 @requires_hdf5plugin
-def test_short_keys_number_the_cases(tmp_path: Path):
-    """A key shorter than 8 bytes numbers the cases in order of appearance."""
+def test_a_short_key_is_still_the_hash_of_its_case(tmp_path: Path):
+    """Whatever its length, a key is the leading bytes of the hash of its case: it does
+    not depend on the order the files come in."""
+    from zarr.codecs.switch import case_key
+
     from virtualizarr.manifests.plan import plan_joined_array
     from virtualizarr.parsers import HDFParser
 
@@ -574,9 +577,16 @@ def test_short_keys_number_the_cases(tmp_path: Path):
         )
     plan = plan_joined_array(pieces, axis=0, select="key", key_bytes=1)
     assert plan.key_bytes == 1
-    assert [c["key"] for c in plan.cases] == ["00", "01"]
-    assert [r["prefix"] for r in plan.refs] == [b"\x00"] * 2 + [b"\x01"] * 2 + [
-        b"\x00"
+    assert [c["key"] for c in plan.cases] == [case_key(c, 1).hex() for c in plan.cases]
+    plain, shuffled = (bytes.fromhex(c["key"]) for c in plan.cases)
+    assert [r["prefix"] for r in plan.refs] == [plain] * 2 + [shuffled] * 2 + [
+        plain
     ] * 2
+    # the same files in another order give each layout the same key
+    backwards = plan_joined_array(
+        pieces[1:] + pieces[:1], axis=0, select="key", key_bytes=1
+    )
+    assert {c["key"] for c in backwards.cases} == {c["key"] for c in plan.cases}
     hashed = plan_joined_array(pieces, axis=0, select="key")
     assert all(len(c["key"]) == 16 for c in hashed.cases)
+    assert [c["key"][:2] for c in hashed.cases] == [c["key"] for c in plan.cases]
