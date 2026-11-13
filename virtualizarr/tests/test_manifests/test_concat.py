@@ -253,7 +253,7 @@ def test_same_chunk_shape_is_one_array_of_plain_chunks(tmp_path: Path):
     array = zarr.open_array(store, path="v", mode="r")
     codec = array.metadata.to_dict()["codecs"][0]
     assert codec["name"] == "switch"
-    assert [case["chunks"] for case in codec["configuration"]["cases"]] == [2, 3, 2]
+    assert codec["configuration"]["runs"] == [[0, 2], [1, 3], [2, 2]]
     expected = np.concatenate([d["v"].values for d in datasets])
     np.testing.assert_array_equal(array[:], expected)
     np.testing.assert_array_equal(array[6:20, 3:9, ::2], expected[6:20, 3:9, ::2])
@@ -454,9 +454,14 @@ def test_append_to_a_joined_array(tmp_path: Path, layouts: str, select: str):
     array = zarr.open_array(repo.readonly_session("main").store, path="v", mode="r")
     configuration = array.metadata.to_dict()["codecs"][0]["configuration"]
     assert configuration.get("select", "position") == select
-    # by position: one case per run of chunks. By key: one per distinct layout, and
-    # the first and last files share theirs.
-    assert len(configuration["cases"]) == (4 if select == "position" else 3)
+    if select == "key":
+        # one case per distinct layout: the first and last files share theirs
+        assert len(configuration["cases"]) == 3
+    else:
+        # one run per file. The first and last files share a case only where neither
+        # ends in a chunk that is cut short.
+        assert len(configuration["runs"]) == 4
+        assert len(configuration["cases"]) in (3, 4)
 
 
 @requires_hdf5plugin
@@ -543,3 +548,35 @@ def test_unwritten_chunks_read_as_their_own_files_fill_value(
         np.testing.assert_array_equal(
             array[5:14, 3:9, 2:7], np.concatenate(expected)[5:14, 3:9, 2:7]
         )
+
+
+@requires_hdf5plugin
+def test_short_keys_number_the_cases(tmp_path: Path):
+    """A key shorter than 8 bytes numbers the cases in order of appearance."""
+    from virtualizarr.manifests.plan import plan_joined_array
+    from virtualizarr.parsers import HDFParser
+
+    rng = np.random.default_rng(3)
+    registry = ObjectStoreRegistry({"file://": LocalStore()})
+    pieces = []
+    for i, shuffle in enumerate([False, True, False]):
+        path = tmp_path / f"f{i}.nc"
+        _write(
+            path,
+            rng.normal(size=(4, 12, 10)).astype("float32"),
+            t0=4 * i,
+            chunksizes=(2, 12, 10),
+            zlib=True,
+            shuffle=shuffle,
+        )
+        pieces.append(
+            HDFParser()(url=f"file://{path}", registry=registry)._group.arrays["v"]
+        )
+    plan = plan_joined_array(pieces, axis=0, select="key", key_bytes=1)
+    assert plan.key_bytes == 1
+    assert [c["key"] for c in plan.cases] == ["00", "01"]
+    assert [r["prefix"] for r in plan.refs] == [b"\x00"] * 2 + [b"\x01"] * 2 + [
+        b"\x00"
+    ] * 2
+    hashed = plan_joined_array(pieces, axis=0, select="key")
+    assert all(len(c["key"]) == 16 for c in hashed.cases)

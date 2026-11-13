@@ -705,9 +705,22 @@ def append_to_joined_array(
 
     existing = cast(Array, group[name])
     axis = get_axis(cast(list[str], list(var.dims)), append_dim)
+    from zarr.codecs import SwitchCodec  # type: ignore[attr-defined]
+
     meta = json.loads(json.dumps(existing.metadata.to_dict(), default=str))
     codec = meta["codecs"][0]["configuration"]
     select = codec.get("select", "position")
+    key_bytes = codec.get("key_bytes", 8)
+    if select == "key" and key_bytes < 8:
+        raise NotImplementedError(
+            f"The array {name!r} numbers its cases with {key_bytes}-byte keys, and new "
+            "files would be numbered again from zero. Appending needs hashed keys "
+            "(8 bytes or more)."
+        )
+    # every run with its own case, however the codec wrote them down
+    codec["cases"] = json.loads(
+        json.dumps(SwitchCodec.from_dict(meta["codecs"][0]).cases)
+    )
     if select == "position" and codec["axis"] != axis:
         raise NotImplementedError(
             f"The array {name!r} is joined along axis {codec['axis']}, not along {append_dim!r}."
@@ -734,6 +747,7 @@ def append_to_joined_array(
         fill_value=existing.fill_value,
         like={"strategy": strategy, "chunk_grid": grid},
         select=select,
+        key_bytes=key_bytes,
     )
     if (plan.strategy == "shards" or select == "key") and not _icechunk_takes_parts():
         raise NotImplementedError(
@@ -754,6 +768,9 @@ def append_to_joined_array(
         else:
             cases.append(case)
     grid[axis] = grid[axis] + plan.chunk_grid[axis]
+    meta["codecs"][0] = SwitchCodec(
+        axis=axis, cases=cases, select=select, key_bytes=key_bytes
+    ).to_dict()
     meta["shape"] = [
         n + (plan.shape[axis] if d == axis else 0) for d, n in enumerate(existing.shape)
     ]
@@ -883,7 +900,11 @@ def write_concatenated_variable_to_icechunk(
         from virtualizarr.options import OPTIONS
 
         plan = plan_joined_array(
-            cma.pieces, cma.axis, dtype=cma.dtype, select=OPTIONS["switch_select"]
+            cma.pieces,
+            cma.axis,
+            dtype=cma.dtype,
+            select=OPTIONS["switch_select"],
+            key_bytes=OPTIONS["switch_key_bytes"],
         )
         if (
             plan.strategy == "shards" or plan.select == "key"

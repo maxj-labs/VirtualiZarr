@@ -65,6 +65,7 @@ def plan_joined_array(
     fill_value: Any = None,
     like: dict | None = None,
     select: str = "position",
+    key_bytes: int = KEY_BYTES,
 ) -> JoinedArrayPlan:
     """
     Plan one array from pieces joined along `axis`.
@@ -81,6 +82,12 @@ def plan_joined_array(
         the chunk's bytes, which every reference carries as a prefix; chunks describe
         themselves and the case table has one entry per distinct layout, but the store
         must take references with a prefix.
+    key_bytes
+        With ``select="key"``, the length of the key. From 8 bytes up a key is a hash of
+        its case, so equal cases have equal keys in any array and tables merge by
+        union. A shorter key numbers the cases in order (1 byte: up to 256 cases,
+        2 bytes: 65,536), which saves a few bytes per reference and means two arrays
+        planned apart cannot be joined without renumbering one.
     shard_length_along_axis
         For virtual shards, how far a shard reaches along the joined axis, when the
         pieces' chunks along it allow more than one choice. A shard may then hold
@@ -131,6 +138,7 @@ def plan_joined_array(
     }
     cases: list[dict] = []
     seen_keys: set[bytes] = set()
+    numbered: dict[str, bytes] = {}
 
     def add_case(n: int, case: dict) -> bytes:
         """Record a case for `n` more chunks. Returns the key its chunks begin with,
@@ -138,7 +146,17 @@ def plan_joined_array(
         if select == "key":
             # the key names the case by its content, so equal cases share one entry
             canonical = json.dumps(case, sort_keys=True, separators=(",", ":"))
-            key = hashlib.sha256(canonical.encode()).digest()[:KEY_BYTES]
+            if key_bytes >= 8:
+                key = hashlib.sha256(canonical.encode()).digest()[:key_bytes]
+            elif canonical in numbered:
+                return numbered[canonical]
+            else:
+                if len(numbered) >= 256**key_bytes:
+                    raise NotImplementedError(
+                        f"more than {256**key_bytes} cases do not fit a key of {key_bytes} bytes"
+                    )
+                key = len(numbered).to_bytes(key_bytes, "big")
+                numbered[canonical] = key
             if key not in seen_keys:
                 seen_keys.add(key)
                 cases.append({"key": key.hex(), **case})
@@ -208,6 +226,7 @@ def plan_joined_array(
             cases,
             notes=notes,
             select=select,
+            key_bytes=key_bytes,
         )
         base = 0
         for p, c, fill in zip(pieces, chunks, fills):
@@ -294,6 +313,7 @@ def plan_joined_array(
         cases,
         notes=notes,
         select=select,
+        key_bytes=key_bytes,
     )
     base = 0
     for p, c, fill in zip(pieces, chunks, fills):

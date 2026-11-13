@@ -6,13 +6,19 @@ from typing import Any, Literal, TypedDict
 class _Options(TypedDict):
     mismatched_concat: Literal["raise", "pieces"]
     switch_select: Literal["position", "key"]
+    switch_key_bytes: int
 
 
-OPTIONS: _Options = {"mismatched_concat": "raise", "switch_select": "position"}
+OPTIONS: _Options = {
+    "mismatched_concat": "raise",
+    "switch_select": "position",
+    "switch_key_bytes": 8,
+}
 
 _VALID: dict[str, tuple[Any, ...]] = {
     "mismatched_concat": ("raise", "pieces"),
     "switch_select": ("position", "key"),
+    "switch_key_bytes": (1, 2, 4, 8, 16),
 }
 
 
@@ -41,6 +47,10 @@ class set_options:
         ``"key"`` from a key that every chunk reference carries as a prefix, so that a
         chunk describes itself (see
         [plan_joined_array][virtualizarr.manifests.plan.plan_joined_array]).
+
+    switch_key_bytes
+        The length of the key when ``switch_select="key"``: 8 (default) or 16 for a key
+        that is a hash of its case, or 1, 2 or 4 for a key that numbers the cases.
 
     Examples
     --------
