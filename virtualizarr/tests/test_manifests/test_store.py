@@ -610,3 +610,30 @@ class TestToVirtualXarray:
             warnings.simplefilter("always")
             manifest_store.to_virtual_dataset(loadable_variables=[])
         assert not [w for w in record if "loadable_variables" in str(w.message)]
+
+
+class TestMissingNodes:
+    """A name that is not in the store has no metadata: zarr turns that into a KeyError."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "does_not_exist/zarr.json",
+            "subgroup/does_not_exist/zarr.json",
+            "does_not_exist/deeper/zarr.json",
+            "foo/does_not_exist/zarr.json",
+        ],
+    )
+    async def test_get_metadata_of_a_missing_node_is_none(self, local_store, key):
+        assert await local_store.get(key, prototype=default_buffer_prototype()) is None
+
+    def test_a_missing_name_is_a_key_error_not_an_empty_group(self, local_store):
+        import zarr
+
+        root = zarr.open_group(local_store, mode="r", zarr_format=3)
+        assert "foo" in dict(root.members())
+        with pytest.raises(KeyError):
+            root["does_not_exist"]
+        with pytest.raises(KeyError):
+            root["subgroup"]["does_not_exist"]

@@ -70,15 +70,18 @@ def _get_deepest_group_or_array(
     Returns:
         A tuple containing:
         - The deepest node reached (ManifestGroup or ManifestArray)
-        - String with remaining unmatched key portion
+        - String with remaining unmatched key portion, in full: for
+          "missing/zarr.json" under a group with no member "missing" that is
+          "missing/zarr.json", not "zarr.json", so the caller can tell a
+          node's own metadata key from a key below a name that does not exist
     """
     var, suffix = key.split("/", 1) if "/" in key else (key, "")
     if var in node.arrays:
         return node.arrays[var], suffix
     if var in node.groups:
         return _get_deepest_group_or_array(node.groups[var], suffix)
-    # Can't traverse deeper - return last node and remainder
-    return node, suffix or var
+    # Can't traverse deeper - return last node and the whole remainder
+    return node, key
 
 
 class ManifestStore(Store):
@@ -148,11 +151,17 @@ class ManifestStore(Store):
     ) -> Buffer | None:
         # docstring inherited
         node, suffix = _get_deepest_group_or_array(self._group, key)
-        if suffix.endswith("zarr.json"):
+        if suffix == "zarr.json":
             # Return metadata
             return node.metadata.to_buffer_dict(prototype=default_buffer_prototype())[
                 "zarr.json"
             ]
+        elif suffix.endswith("zarr.json"):
+            # The key is the metadata of something below `node` that is not in
+            # the store. Zarr-Python reads None as "no such node" and raises
+            # KeyError; answering with `node`'s own metadata would make every
+            # missing name look like an empty group.
+            return None
         elif suffix.endswith((".zattrs", ".zgroup", ".zarray", ".zmetadata")):
             # Zarr-Python expects store classes to return None when metadata JSONs are not found.
             # Zarr-Python uses this behavior to distinguish between V2/V3 and consolidated/unconsolidated stores.
