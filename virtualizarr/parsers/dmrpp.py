@@ -18,6 +18,7 @@ from virtualizarr.manifests import (
 from virtualizarr.manifests.utils import create_v3_array_metadata
 from virtualizarr.parsers.utils import encode_cf_fill_value
 from virtualizarr.types import ChunkKey
+from virtualizarr.utils import determine_chunk_grid_shape
 
 
 class DMRPPParser:
@@ -330,11 +331,14 @@ class DMRParser:
                 try:
                     variable = self._parse_variable(var_tag)
                     manifest_dict[var_name] = variable
-                except (UnboundLocalError, ValueError):
+                except Exception as error:
+                    # One variable the parser cannot represent must not cost the
+                    # caller every other variable in the file.
                     warnings.warn(
                         f"This DMRpp contains the variable {var_name} that could not"
                         " be parsed. Consider adding it to the list  of skipped "
                         "variables, or opening an issue to help resolve this"
+                        f" ({type(error).__name__}: {error})"
                     )
 
         # Attributes
@@ -459,11 +463,33 @@ class DMRParser:
         dtype = np.dtype(
             self._DAP_NP_DTYPE[var_tag.tag.removeprefix("{" + self._NS["dap"] + "}")]
         )
+        # A <String> stored as fixed-width bytes says so, and how wide, in a
+        # <dmrpp:FixedLengthStringArray> child. That is a fixed-size type in the
+        # file, which chunk references can describe.
+        fixed_length_tag = var_tag.find("dmrpp:FixedLengthStringArray", self._NS)
+        if fixed_length_tag is not None:
+            string_length = self._get_attrib(fixed_length_tag, "string_length")
+            if string_length is not None:
+                dtype = np.dtype(f"S{int(string_length)}")
+        if dtype == np.object_:
+            raise ValueError(
+                "variable-length strings cannot be represented as virtual chunk references"
+            )
         # Chunks and Filters
         shape: tuple[int, ...] = tuple(dims.values())
         chunks_shape = shape
         chunks_tag = var_tag.find("dmrpp:chunks", self._NS)
-        array_fill_value = np.array(0).astype(dtype)[()]
+        if chunks_tag is None:
+            raise ValueError("the variable has no <dmrpp:chunks> element")
+        # The stored byte order is on the chunks element. Without this a
+        # big-endian file would be decoded as little-endian with no error.
+        if (
+            self._get_attrib(chunks_tag, "byteOrder") == "BE"
+            and dtype.kind in "iuf"
+            and dtype.itemsize > 1
+        ):
+            dtype = dtype.newbyteorder(">")
+        array_fill_value = np.zeros((), dtype=dtype)[()]
         if chunks_tag is not None:
             # Chunks
             chunk_dim_text = chunks_tag.findtext(
@@ -477,10 +503,11 @@ class DMRParser:
             fill_value = self._get_attrib(chunks_tag, "fillValue")
             if fill_value is not None:
                 array_fill_value = np.array(fill_value).astype(dtype)[()]
-            if chunks_shape:
-                chunkmanifest = self._parse_chunks(chunks_tag, chunks_shape)
-            else:
-                chunkmanifest = ChunkManifest(entries={}, shape=array_fill_value.shape)
+            chunkmanifest = self._parse_chunks(
+                chunks_tag,
+                chunks_shape,
+                chunk_grid_shape=determine_chunk_grid_shape(shape, chunks_shape),
+            )
             # Filters
             codecs = self._parse_filters(chunks_tag, dtype)
 
@@ -579,7 +606,14 @@ class DMRParser:
         if compression_type is not None:
             filters: list[dict] = []
             # shuffle deflate --> ["shuffle", "deflate"]
-            compression_types = compression_type.split(" ")
+            # HDF5 only ever shuffles before it compresses, and Hyrax reads the
+            # two words as a set: older build_dmrpp versions wrote "deflate
+            # shuffle" for the same files newer ones describe as "shuffle
+            # deflate". Codecs are listed in the order they were applied, so
+            # shuffle goes first whichever way the sidecar spells it.
+            compression_types = sorted(
+                compression_type.split(), key=lambda name: name != "shuffle"
+            )
             for c in compression_types:
                 if c == "shuffle":
                     filters.append(
@@ -607,7 +641,10 @@ class DMRParser:
         return None
 
     def _parse_chunks(
-        self, chunks_tag: ET.Element, chunks_shape: tuple[int, ...]
+        self,
+        chunks_tag: ET.Element,
+        chunks_shape: tuple[int, ...],
+        chunk_grid_shape: tuple[int, ...] | None = None,
     ) -> ChunkManifest:
         """
         Parse the chunk manifest from a DMR++ chunks tag.
@@ -619,6 +656,10 @@ class DMRParser:
 
         chunks_shape : tuple
             Chunk sizes for each dimension. E.g. (1, 1447, 2895)
+
+        chunk_grid_shape : tuple, optional
+            Number of chunks along each dimension. Needed to describe a variable
+            with no stored chunks, which is all fill value.
 
         Returns
         -------
@@ -650,4 +691,20 @@ class DMRParser:
                     "offset": int(offset),
                     "length": int(n_bytes),
                 }
+        if not chunks_shape and chunkmanifest:
+            # a scalar has one chunk and no chunk key to give it
+            (entry,) = chunkmanifest.values()
+            return ChunkManifest.from_arrays(
+                paths=np.array(entry["path"], dtype=np.dtypes.StringDType),  # type: ignore
+                offsets=np.array(entry["offset"], dtype=np.uint64),
+                lengths=np.array(entry["length"], dtype=np.uint64),
+            )
+        if not chunkmanifest:
+            # declared but never written: every chunk is missing, so it reads as fill value
+            return ChunkManifest(
+                entries={},
+                shape=chunk_grid_shape
+                if chunk_grid_shape is not None
+                else tuple(1 for _ in chunks_shape),
+            )
         return ChunkManifest(entries=chunkmanifest)

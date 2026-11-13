@@ -767,3 +767,176 @@ def test_dmrpp_missing_attrib_validation(dmrpp_xml_with_missing_attrib):
     # Verify manifest store was still created (parser continues despite issues)
     assert manifest_store is not None
     assert manifest_store._group is not None
+
+
+# --- sidecars found in NASA's archive that the parser could not read ---------------
+#
+# Each test writes a small HDF5 file, describes it with DMR++ the way a sidecar in the
+# archive does, and checks that the values read through the sidecar are the file's own.
+
+_DMRPP_HEADER = (
+    '<?xml version="1.0" encoding="ISO-8859-1"?>\n'
+    '<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" xmlns:dmrpp="http://xml.opendap.org/dap/dmrpp/1.0.0#" '
+    'dapVersion="4.0" dmrVersion="1.0" name="sidecar_test.h5" dmrpp:href="OPeNDAP_DMRpp_DATA_ACCESS_URL">\n'
+)
+
+
+def _chunk_tags(dataset) -> str:
+    """One <dmrpp:chunk> per stored chunk of an h5py dataset."""
+    tags = []
+    for index in range(dataset.id.get_num_chunks()):
+        info = dataset.id.get_chunk_info(index)
+        position = (
+            f' chunkPositionInArray="[{",".join(map(str, info.chunk_offset))}]"'
+            if dataset.ndim
+            else ""
+        )
+        tags.append(
+            f'<dmrpp:chunk offset="{info.byte_offset}" nBytes="{info.size}"{position}/>'
+        )
+    return "".join(tags)
+
+
+def _read_through_sidecar(tmp_path, xml_body: str, name: str):
+    import zarr
+
+    path = tmp_path / "sidecar_test.h5"
+    parser = dmrparser(
+        _DMRPP_HEADER + xml_body + "</Dataset>\n", filepath=f"file://{path}"
+    )
+    store = parser.parse_dataset(
+        object_store=obstore_local(url=f"file://{path}"), group="/"
+    )
+    return zarr.open_group(store, mode="r", zarr_format=3)[name][...]
+
+
+@pytest.mark.parametrize("compression_type", ["shuffle deflate", "deflate shuffle"])
+def test_dmrpp_shuffle_and_deflate_in_either_listed_order(tmp_path, compression_type):
+    """Sidecars written by older ``build_dmrpp`` versions list the filters as
+    "deflate shuffle"; newer ones as "shuffle deflate". Both describe the only
+    order HDF5 applies them in: shuffle, then deflate."""
+    import h5py
+    import numpy as np
+
+    expected = np.arange(24, dtype="float32").reshape(4, 6) * 1.5
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        data = f.create_dataset(
+            "data",
+            data=expected,
+            chunks=(2, 6),
+            shuffle=True,
+            compression="gzip",
+            compression_opts=4,
+        )
+        chunks = _chunk_tags(data)
+    body = (
+        '<Dimension name="y" size="4"/><Dimension name="x" size="6"/>'
+        '<Float32 name="data"><Dim name="/y"/><Dim name="/x"/>'
+        f'<dmrpp:chunks compressionType="{compression_type}" byteOrder="LE">'
+        f"<dmrpp:chunkDimensionSizes>2 6</dmrpp:chunkDimensionSizes>{chunks}</dmrpp:chunks></Float32>"
+    )
+    np.testing.assert_array_equal(
+        _read_through_sidecar(tmp_path, body, "data"), expected
+    )
+
+
+def test_dmrpp_scalar_string_does_not_stop_the_other_variables(tmp_path):
+    """A scalar String variable (a ``crs`` container, say) carries
+    ``fillValue="unsupported-string"``. It cannot be represented, but the
+    variables beside it must still parse."""
+    import h5py
+    import numpy as np
+
+    expected = np.arange(6, dtype="float64")
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        chunks = _chunk_tags(f.create_dataset("data", data=expected, chunks=(6,)))
+    body = (
+        '<Dimension name="x" size="6"/>'
+        f'<Float64 name="data"><Dim name="/x"/><dmrpp:chunks byteOrder="LE"><dmrpp:chunkDimensionSizes>6</dmrpp:chunkDimensionSizes>{chunks}</dmrpp:chunks></Float64>'
+        '<String name="crs"><Attribute name="grid_mapping_name" type="String"><Value>latitude_longitude</Value></Attribute>'
+        '<dmrpp:chunks fillValue="unsupported-string"><dmrpp:chunk offset="14258254" nBytes="1"/></dmrpp:chunks></String>'
+    )
+    with pytest.warns(UserWarning, match="crs"):
+        values = _read_through_sidecar(tmp_path, body, "data")
+    np.testing.assert_array_equal(values, expected)
+
+
+def test_dmrpp_scalar_number_keeps_its_chunk(tmp_path):
+    """A scalar with stored data must be read from the file, not returned as its fill value."""
+    import h5py
+    import numpy as np
+
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        scalar = f.create_dataset("t", data=np.float64(846385506.5))
+        offset, size = scalar.id.get_offset(), scalar.id.get_storage_size()
+    body = f'<Float64 name="t"><dmrpp:chunks byteOrder="LE"><dmrpp:chunk offset="{offset}" nBytes="{size}"/></dmrpp:chunks></Float64>'
+    assert _read_through_sidecar(tmp_path, body, "t") == 846385506.5
+
+
+def test_dmrpp_variable_with_no_stored_chunks_reads_as_fill_value(tmp_path):
+    """A variable that was declared and never written has a <dmrpp:chunks> element
+    with no <dmrpp:chunk> inside. It is all fill value, not unparseable."""
+    import h5py
+    import numpy as np
+
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        f.create_dataset(
+            "profile", shape=(4,), dtype="int32", chunks=(2,), fillvalue=-9999
+        )
+    body = (
+        '<Dimension name="profile" size="4"/>'
+        '<Int32 name="profile"><Dim name="/profile"/><dmrpp:chunks fillValue="-9999" byteOrder="LE">'
+        "<dmrpp:chunkDimensionSizes>2</dmrpp:chunkDimensionSizes></dmrpp:chunks></Int32>"
+    )
+    np.testing.assert_array_equal(
+        _read_through_sidecar(tmp_path, body, "profile"),
+        np.full(4, -9999, dtype="int32"),
+    )
+
+
+def test_dmrpp_fixed_length_string_array(tmp_path):
+    """<String> with <dmrpp:FixedLengthStringArray> is fixed-width bytes in the file."""
+    import h5py
+    import numpy as np
+
+    expected = np.array([b"AT", b"om", b"-2", b"V2"], dtype="S2")
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        chunks = _chunk_tags(
+            f.create_dataset(
+                "Flight_ID",
+                data=expected,
+                chunks=(4,),
+                shuffle=True,
+                compression="gzip",
+            )
+        )
+    body = (
+        '<Dimension name="flight" size="4"/>'
+        '<String name="Flight_ID"><Dim name="/flight"/>'
+        '<dmrpp:chunks compressionType="shuffle deflate" deflateLevel="4" fillValue="">'
+        f"<dmrpp:chunkDimensionSizes>4</dmrpp:chunkDimensionSizes>{chunks}</dmrpp:chunks>"
+        '<dmrpp:FixedLengthStringArray string_length="2" pad="null_term"/></String>'
+    )
+    np.testing.assert_array_equal(
+        _read_through_sidecar(tmp_path, body, "Flight_ID"), expected
+    )
+
+
+def test_dmrpp_big_endian_data_is_read_as_big_endian(tmp_path):
+    """``byteOrder="BE"`` on the chunks element is the file's byte order."""
+    import h5py
+    import numpy as np
+
+    expected = np.arange(6, dtype=">f4") + 0.25
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        # dtype is given explicitly: h5py otherwise stores the array in native byte order
+        chunks = _chunk_tags(
+            f.create_dataset("data", data=expected, dtype=">f4", chunks=(6,))
+        )
+    body = (
+        '<Dimension name="x" size="6"/><Float32 name="data"><Dim name="/x"/>'
+        f'<dmrpp:chunks byteOrder="BE"><dmrpp:chunkDimensionSizes>6</dmrpp:chunkDimensionSizes>{chunks}</dmrpp:chunks></Float32>'
+    )
+    np.testing.assert_array_equal(
+        _read_through_sidecar(tmp_path, body, "data"), expected
+    )
