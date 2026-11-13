@@ -685,9 +685,22 @@ class DMRParser:
             chunk_key = ChunkKey(chunk_key_template.format(*chunk_num))
             offset = self._get_attrib(chunk_tag, "offset", required=True)
             n_bytes = self._get_attrib(chunk_tag, "nBytes", required=True)
+            # A chunk may live in another object than the data file: Hyrax keeps
+            # values the file does not hold (a dimension with no coordinate
+            # variable, say) in a separate "missing data" file and points at it
+            # with href. Reading that offset from the data file returns
+            # unrelated bytes.
+            path = self.data_filepath
+            href = self._get_attrib(chunk_tag, "href")
+            if href is not None:
+                if href.startswith("OPeNDAP_DMRpp_"):
+                    raise ValueError(
+                        f"a chunk is stored outside the data file, at a location the DMR++ only names as {href}"
+                    )
+                path = href
             if offset is not None and n_bytes is not None:
                 chunkmanifest[chunk_key] = {
-                    "path": self.data_filepath,
+                    "path": path,
                     "offset": int(offset),
                     "length": int(n_bytes),
                 }

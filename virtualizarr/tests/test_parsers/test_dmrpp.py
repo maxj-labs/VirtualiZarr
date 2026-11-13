@@ -940,3 +940,47 @@ def test_dmrpp_big_endian_data_is_read_as_big_endian(tmp_path):
     np.testing.assert_array_equal(
         _read_through_sidecar(tmp_path, body, "data"), expected
     )
+
+
+def test_dmrpp_chunk_stored_outside_the_data_file(tmp_path):
+    """A chunk with ``href`` is not in the data file. With a real URL it is read
+    from there; with the placeholder Hyrax resolves itself, the variable is
+    skipped rather than read from the wrong object."""
+    import h5py
+    import numpy as np
+
+    expected = np.arange(6, dtype="float64")
+    with h5py.File(tmp_path / "sidecar_test.h5", "w") as f:
+        chunks = _chunk_tags(f.create_dataset("data", data=expected, chunks=(6,)))
+    data = (
+        '<Dimension name="x" size="6"/><Dimension name="nb" size="4"/>'
+        f'<Float64 name="data"><Dim name="/x"/><dmrpp:chunks byteOrder="LE"><dmrpp:chunkDimensionSizes>6</dmrpp:chunkDimensionSizes>{chunks}</dmrpp:chunks></Float64>'
+    )
+    missing = (
+        '<Float32 name="nb"><Dim name="/nb"/><dmrpp:chunks compressionType="deflate" byteOrder="LE">'
+        "<dmrpp:chunkDimensionSizes>4</dmrpp:chunkDimensionSizes>"
+        '<dmrpp:chunk offset="5223" nBytes="18" chunkPositionInArray="[0]" href="{href}"/></dmrpp:chunks></Float32>'
+    )
+    with pytest.warns(UserWarning, match="nb.*outside the data file"):
+        values = _read_through_sidecar(
+            tmp_path,
+            data + missing.format(href="OPeNDAP_DMRpp_MISSING_DATA_ACCESS_URL"),
+            "data",
+        )
+    np.testing.assert_array_equal(values, expected)
+
+    parser = dmrparser(
+        _DMRPP_HEADER
+        + '<Dimension name="nb" size="4"/>'
+        + missing.format(href="s3://bucket/granule.nc.missing")
+        + "</Dataset>\n",
+        filepath="s3://bucket/granule.nc",
+    )
+    # the dimension and the variable share a name, as they do in the archive
+    (var_tag,) = parser._find_var_tags(parser.root)
+    entry = parser._parse_variable(var_tag).manifest.dict()["0"]
+    assert entry == {
+        "path": "s3://bucket/granule.nc.missing",
+        "offset": 5223,
+        "length": 18,
+    }
