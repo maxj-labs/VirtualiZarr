@@ -40,6 +40,10 @@
   [zizmor](https://docs.zizmor.sh/) on changes to the workflows and the Dependabot config, the test workflows now use
   a read-only token by default, and no workflow leaves checkout credentials on disk.
   By [Max Jones](https://github.com/maxrjones).
+- The release workflow now builds the sdist and wheel with build tools pinned by hash
+  (`ci/release/requirements.txt`), and no longer installs or imports the built package in a job that is able to
+  publish. `wheel` and `check-manifest` are no longer build requirements.
+  By [Max Jones](https://github.com/maxrjones).
 
 ## v2.8.0 (14th October 2026)
 

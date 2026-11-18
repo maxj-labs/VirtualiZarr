@@ -1,0 +1,12 @@
+# Tools the release workflow (.github/workflows/release.yml) uses to build and
+# check the sdist and wheel. `setuptools` and `setuptools-scm` are the build
+# backend from `[build-system]` in pyproject.toml; they are listed here because
+# the workflow builds with `--no-isolation`, so that the backend comes from the
+# hash-pinned requirements.txt and is not resolved fresh from PyPI on release day.
+#
+# To regenerate requirements.txt, run the command recorded at the top of that
+# file, moving the --exclude-newer date to one week before today.
+build
+setuptools
+setuptools-scm
+twine

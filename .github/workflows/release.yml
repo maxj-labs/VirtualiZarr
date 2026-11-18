@@ -27,15 +27,19 @@ jobs:
         name: Install Python
         with:
           python-version: '3.13'
-      - name: Install dependencies
+      - name: Install build tools
+        # Every version is pinned by hash, so a release is built with tools that
+        # were reviewed when ci/release/requirements.txt was last updated, not
+        # with whatever PyPI serves on release day.
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install setuptools setuptools-scm wheel twine check-manifest
+          python -m pip install --require-hashes --no-deps -r ci/release/requirements.txt
           git clean -xdf
           git restore -SW .
       - name: Build tarball and wheels
+        # --no-isolation: use the pinned setuptools and setuptools-scm installed
+        # above. An isolated build would resolve `[build-system] requires` afresh.
         run: |
-          python -m build --sdist --wheel .
+          python -m build --no-isolation --sdist --wheel .
       - name: Check built artifacts
         run: |
           python -m twine check --strict dist/*
@@ -52,13 +56,11 @@ jobs:
           path: dist
 
   test-built-dist:
+    # Installs the wheel together with all of its dependencies and imports it.
+    # This job runs third-party code, so it deliberately has no deployment
+    # environment and no `id-token` permission: nothing here can publish.
     needs: build-artifacts
     runs-on: ubuntu-latest
-    environment:
-      name: test-release
-      url: https://test.pypi.org/p/virtualizarr
-    permissions:
-      id-token: write
     steps:
       - uses: actions/setup-python@v6.3.0
         name: Install Python
@@ -74,25 +76,40 @@ jobs:
           ls -ltrh dist
       - name: Verify the built dist/wheel is valid
         run: |
-          python -m pip install --upgrade pip
           python -m pip install dist/virtualizarr*.whl
           python -c "import virtualizarr; print(virtualizarr.__version__)"
+
+  publish-to-testpypi:
+    # The publishing jobs only download the built artifacts and hand them to the
+    # publish action. Keep it that way: do not install or run anything here.
+    needs: test-built-dist
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment:
+      name: test-release
+      url: https://test.pypi.org/p/virtualizarr
+    permissions:
+      id-token: write # Trusted publishing to TestPyPI
+    steps:
+      - uses: actions/download-artifact@v5.0.0
+        with:
+          name: releases
+          path: dist
       - name: Publish package to TestPyPI
-        if: github.event_name == 'release'
         uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           repository-url: https://test.pypi.org/legacy/
           # verbose: true
 
   upload-to-pypi:
-    needs: test-built-dist
+    needs: publish-to-testpypi
     if: github.event_name == 'release'
     runs-on: ubuntu-latest
     environment:
       name: release
       url: https://pypi.org/p/virtualizarr
     permissions:
-      id-token: write
+      id-token: write # Trusted publishing to PyPI
     steps:
       - uses: actions/download-artifact@v5.0.0
         with:

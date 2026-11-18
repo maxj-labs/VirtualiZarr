@@ -106,6 +106,12 @@ gh actions-lock
 
 Changes to the workflows and to `.github/dependabot.yml` are also checked by [zizmor](https://docs.zizmor.sh/).
 
+#### Release build tools
+
+The release workflow builds the sdist and wheel with the tools listed in `ci/release/requirements.in`, installed at the exact versions and hashes recorded in `ci/release/requirements.txt`, so a release is never built with a version of `setuptools`, `build` or `twine` that nobody has looked at. Dependabot proposes updates to the pinned file. To regenerate it by hand, for example after editing `requirements.in`, run the command recorded at the top of `requirements.txt` with [uv](https://docs.astral.sh/uv/), moving the `--exclude-newer` date to one week before today so that very recent uploads are left out.
+
+The jobs in `release.yml` that publish to TestPyPI and PyPI only download the built files and pass them to the publish action. Please keep them that way: anything that installs or runs code belongs in a job without the `id-token` permission.
+
 #### Private functions
 
 `VirtualiZarr` uses the following convention for private functions:

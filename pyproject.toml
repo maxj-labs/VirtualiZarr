@@ -144,11 +144,12 @@ Home = "https://github.com/zarr-developers/VirtualiZarr"
 Documentation = "https://github.com/zarr-developers/VirtualiZarr/blob/main/README.md"
 
 [build-system]
+# Keep this list to what the build needs: everything in it is installed, and can
+# run code, whenever a wheel or sdist is built. The release workflow takes its
+# versions from the hash-pinned ci/release/requirements.txt.
 requires = [
     "setuptools>=61.0.0",
-    "wheel",
     "setuptools_scm[toml]>=7.0",
-    "check-manifest",
 ]
 
 [tool.pixi.workspace]

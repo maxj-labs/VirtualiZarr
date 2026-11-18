@@ -13,3 +13,14 @@ updates:
           - "*"
     cooldown:
       default-days: 7
+  # The hash-pinned tools that build a release (see release.yml).
+  - package-ecosystem: "pip"
+    directory: "/ci/release"
+    schedule:
+      interval: "weekly"
+    groups:
+      release-tools:
+        patterns:
+          - "*"
+    cooldown:
+      default-days: 7
