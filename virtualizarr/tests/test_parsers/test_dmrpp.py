@@ -1,3 +1,5 @@
+import sys
+
 import numpy as np
 import pytest
 import xarray as xr
@@ -7,11 +9,8 @@ from obstore.store import LocalStore
 from virtualizarr.manifests import ManifestStore
 from virtualizarr.parsers import DMRPPParser, HDFParser
 from virtualizarr.tests import requires_network, requires_pydap, slow_test
-from virtualizarr.tests.utils import obstore_local, obstore_s3
+from virtualizarr.tests.utils import obstore_s3
 from virtualizarr.xarray import open_virtual_dataset
-
-pytest.importorskip("pydap")
-from pydap.virtualizarr.parser import DMRParser  # noqa: E402
 
 urls = [
     (
@@ -138,75 +137,29 @@ def test_dmrpp_open_virtual_dataset_local(dmrpp_grouped_url):
 
 
 @requires_pydap
-def test_dmrpp_simple(dmrpp_xml_simple):
-    """Test parsing a simple valid DMR++ XML creates virtual chunk manifests."""
-    parser = DMRParser(
-        dmrpp_xml_simple, object_store=obstore_local(url="file:///simple.nc")
-    )
-
-    # Parse dataset
-    manifest_store = parser.parse_dataset(group="/")
-
-    # Verify manifest store is created
-    assert manifest_store is not None
-
-    # Verify dimensions are parsed correctly from the manifest group (accessing private _group for testing)
-    manifest_group = manifest_store._group
-    assert manifest_group is not None
-
-    # The manifest group should have arrays with correct dimensions
-    assert "temperature" in manifest_group.arrays
-    temperature_array = manifest_group.arrays["temperature"]
-    assert temperature_array.shape == (25, 53)
-
-    # Verify chunk manifest exists
-    temperature_manifest = temperature_array.manifest.dict()
-    assert len(temperature_manifest) > 0
-
-    # Verify chunk manifest entries have expected structure
-    for key, chunk_info in temperature_manifest.items():
-        assert "path" in chunk_info
-        assert "offset" in chunk_info
-        assert "length" in chunk_info
-        assert chunk_info["path"] == "file:///simple.nc"
-        assert isinstance(chunk_info["offset"], int)
-        assert isinstance(chunk_info["length"], int)
+def test_dmrpp_reads_stored_values(dmrpp_hdf5_url):
+    """Values read through the DMR++ file are the values stored in the HDF5 file."""
+    manifest_store = DMRPPParser()(url=dmrpp_hdf5_url, registry=local_registry())
+    with xr.open_dataset(
+        manifest_store, engine="zarr", consolidated=False, zarr_format=3
+    ) as ds:
+        np.testing.assert_array_equal(
+            ds["grid"].values, np.arange(24, dtype="int32").reshape(4, 6)
+        )
 
 
 @requires_pydap
-def test_dmrpp_missing_attrib_validation(dmrpp_xml_with_missing_attrib):
-    """Test that validation issues are accumulated for missing attributes."""
-    parser = DMRParser(
-        dmrpp_xml_with_missing_attrib,
-        object_store=obstore_local(url="file:///validation_test.nc"),
-    )
-
-    # Parse dataset - this should accumulate validation issues
-    manifest_store = parser.parse_dataset(group="/")
-
-    # Verify that validation issues were accumulated
-    assert len(parser._validation_issues) > 0
-
-    # Check that the issues mention missing attributes
-    assert any(
-        "Missing required attribute 'name'" in issue
-        for issue in parser._validation_issues
-    )
-
-    # Verify manifest store was still created (parser continues despite issues)
-    assert manifest_store is not None
-    assert manifest_store._group is not None
-
-
-@requires_network
-@requires_pydap
-def test_inlinevalue(inlinevalue_dmrpp):
-    """
-    Test that inline values can be parsed into manifest
-    """
-    parser = DMRParser(
-        inlinevalue_dmrpp, object_store=obstore_local(url="file:///compact_lowlevel.h5")
-    )
-    ms = parser.parse_dataset()
-    with xr.open_dataset(ms, engine="zarr", consolidated=False, zarr_format=3) as ds:
+def test_dmrpp_reads_inlined_values(dmrpp_inline_url):
+    """A variable whose values are inlined in the DMR++ file is read from there."""
+    manifest_store = DMRPPParser()(url=dmrpp_inline_url, registry=local_registry())
+    with xr.open_dataset(
+        manifest_store, engine="zarr", consolidated=False, zarr_format=3
+    ) as ds:
         np.testing.assert_array_equal(ds["my_dataset"].values, np.arange(10))
+
+
+def test_dmrpp_without_pydap_names_the_extra(monkeypatch, dmrpp_simple_url):
+    """Without pydap the error says which extra to install."""
+    monkeypatch.setitem(sys.modules, "pydap", None)
+    with pytest.raises(ImportError, match=r"virtualizarr\[dmrpp\]"):
+        DMRPPParser()(url=dmrpp_simple_url, registry=local_registry())

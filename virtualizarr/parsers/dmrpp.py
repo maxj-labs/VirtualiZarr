@@ -46,7 +46,7 @@ class DMRPPParser:
         ManifestStore
             A ManifestStore that provides a Zarr representation of the data source referenced by the DMR++ file.
         """
-        soft_import("pydap", "parsing DMR++ references (install `virtualizarr[pydap]`)")
+        soft_import("pydap", "parsing DMR++ references (install `virtualizarr[dmrpp]`)")
         from pydap.virtualizarr.parser import DMRParser
 
         parser = DMRParser(

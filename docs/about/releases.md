@@ -14,8 +14,13 @@
 
 ### Breaking changes
 
-  - `DMRPPParser` is now migrated to [pydap](https://github.com/pydap/pydap) (`pydap>=5.10`) (see [pydap#417](https://github.com/pydap/pydap/issues/417)). To use the dmrpp parser one  must install the extra `pip install "virtualizarr[dmrpp]"`.
-  By [Miguel Jimenez-Urias](https://github.com/Mikejmnez)
+- `DMRPPParser` now delegates to [pydap](https://github.com/pydap/pydap), which maintains the DMR++ parser
+  (see [pydap#417](https://github.com/pydap/pydap/issues/417)). It is no longer part of the base installation:
+  install the `dmrpp` extra, `pip install "virtualizarr[dmrpp]"`, which requires a pydap release newer than 3.5.11.
+  Packages that call `DMRPPParser` for their users, such as earthaccess, need to depend on that extra.
+  The `virtualizarr.parsers.dmrpp.DMRParser` class is removed; use `pydap.virtualizarr.parser.DMRParser`.
+  ([#902](https://github.com/zarr-developers/VirtualiZarr/pull/902)).
+  By [Miguel Jimenez-Urias](https://github.com/Mikejmnez).
 
 ### Bug fixes
 

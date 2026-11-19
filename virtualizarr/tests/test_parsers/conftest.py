@@ -695,3 +695,77 @@ def dmrpp_grouped_url(tmp_path: Path, dmrpp_xml_grouped) -> str:
     filepath = tmp_path / "grouped.nc.dmrpp"
     filepath.write_text(dmrpp_xml_grouped)
     return f"file://{filepath}"
+
+
+@pytest.fixture()
+def dmrpp_inline_url(tmp_path: Path) -> str:
+    """Write a DMR++ file whose only variable is stored inline (``dmrpp:compact``)
+    and return its URL. The variable is ``np.arange(10)`` as int64."""
+    filepath = tmp_path / "compact_lowlevel.h5.dmrpp"
+    filepath.write_text(
+        textwrap.dedent(
+            """\
+            <?xml version="1.0" encoding="ISO-8859-1"?>
+            <Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" xmlns:dmrpp="http://xml.opendap.org/dap/dmrpp/1.0.0#" dapVersion="4.0" dmrVersion="2.0" name="compact_lowlevel.h5" dmrpp:href="data/dmrpp/compact_lowlevel.h5" dmrpp:version="3.21.1">
+                <Int64 name="my_dataset">
+                    <Dim size="10"/>
+                    <dmrpp:chunks fillValue="0"/>
+                    <dmrpp:compact>AAAAAAAAAAABAAAAAAAAAAIAAAAAAAAAAwAAAAAAAAAEAAAAAAAAAAUAAAAAAAAABgAAAAAAAAAHAAAAAAAAAAgAAAAAAAAACQAAAAAAAAA=</dmrpp:compact>
+                </Int64>
+                <Attribute name="build_dmrpp_metadata" type="Container">
+                    <Attribute name="created" type="String">
+                        <Value>2026-02-17T22:11:14Z</Value>
+                    </Attribute>
+                    <Attribute name="build_dmrpp" type="String">
+                        <Value>3.21.1</Value>
+                    </Attribute>
+                    <Attribute name="bes" type="String">
+                        <Value>3.21.1</Value>
+                    </Attribute>
+                    <Attribute name="libdap" type="String">
+                        <Value>libdap-3.21.1</Value>
+                    </Attribute>
+                    <Attribute name="invocation" type="String">
+                        <Value>build_dmrpp -f /Users/myang6/work/opendap/hyrax-2016/bes/modules/hdf5_handler/data/src/compact_lowlevel.h5 -r compact_lowlevel.h5.dmr -u OPeNDAP_DMRpp_DATA_ACCESS_URL -M</Value>
+                    </Attribute>
+                </Attribute>
+            </Dataset>
+            """
+        )
+    )
+    return f"file://{filepath}"
+
+
+@pytest.fixture()
+def dmrpp_hdf5_url(tmp_path: Path) -> str:
+    """Write an HDF5 file with one chunked, compressed 2-D variable and a DMR++
+    file that describes it, and return the URL of the DMR++ file. The variable is
+    ``np.arange(24, dtype="int32").reshape(4, 6)``."""
+    data = np.arange(24, dtype="<i4").reshape(4, 6)
+    filepath = tmp_path / "grid.h5"
+    with h5py.File(filepath, "w") as f:
+        dataset = f.create_dataset(
+            "grid", data=data, chunks=(2, 6), shuffle=True, compression="gzip"
+        )
+        f.flush()
+        chunks = [
+            dataset.id.get_chunk_info(i) for i in range(dataset.id.get_num_chunks())
+        ]
+    chunk_tags = "".join(
+        f'<dmrpp:chunk offset="{c.byte_offset}" nBytes="{c.size}" '
+        f'chunkPositionInArray="[{c.chunk_offset[0]},{c.chunk_offset[1]}]"/>'
+        for c in chunks
+    )
+    Path(f"{filepath}.dmrpp").write_text(
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        '<Dataset xmlns="http://xml.opendap.org/ns/DAP/4.0#" '
+        'xmlns:dmrpp="http://xml.opendap.org/dap/dmrpp/1.0.0#" '
+        'dapVersion="4.0" dmrVersion="1.0" name="grid.h5">'
+        '<Dimension name="y" size="4"/><Dimension name="x" size="6"/>'
+        '<Int32 name="grid"><Dim name="/y"/><Dim name="/x"/>'
+        '<dmrpp:chunks compressionType="shuffle deflate" deflateLevel="4" '
+        'fillValue="0" byteOrder="LE">'
+        "<dmrpp:chunkDimensionSizes>2 6</dmrpp:chunkDimensionSizes>"
+        f"{chunk_tags}</dmrpp:chunks></Int32></Dataset>"
+    )
+    return f"file://{filepath}.dmrpp"
